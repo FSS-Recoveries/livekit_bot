@@ -1,0 +1,17 @@
+# Core SDKs
+livekit==1.0.13
+livekit-api==1.0.5
+
+# Agents framework
+livekit-agents==1.2.9
+
+# Plugins actually used by DebtCollector_eleven11.py (stt/llm/vad/tts)
+livekit-plugins-openai==1.2.9
+livekit-plugins-deepgram==1.2.9
+livekit-plugins-silero==1.2.9
+livekit-plugins-elevenlabs==1.2.9
+
+# Utilities
+python-dotenv>=1.0.1
+requests>=2.32.0
+aiohttp>=3.11.0
