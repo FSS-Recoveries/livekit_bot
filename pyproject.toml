@@ -13,6 +13,7 @@ dependencies = [
     "livekit-plugins-azure==1.6.7",
     "livekit-plugins-deepgram==1.6.7",
     "livekit-plugins-elevenlabs==1.6.7",
+    "livekit-plugins-google>=1.6.7",
     "livekit-plugins-noise-cancellation>=0.3.0",
     "livekit-plugins-openai==1.6.7",
     "livekit-plugins-silero==1.6.7",

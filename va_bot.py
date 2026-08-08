@@ -24,13 +24,14 @@ from livekit.agents import (
     get_job_context,
     tts as agents_tts,
     stt as agents_stt,
+    llm as agents_llm,
     BackgroundAudioPlayer,
     AudioConfig,
     BuiltinAudioClip,
 )
 from livekit.agents.inference import TurnDetector
 from livekit.agents.metrics import ModelUsageCollector
-from livekit.plugins import deepgram, openai, silero, elevenlabs, noise_cancellation, azure
+from livekit.plugins import deepgram, openai, silero, elevenlabs, noise_cancellation, azure, google
 from livekit.agents.voice.amd import AMD, AMDCategory
 
 import firebase_admin
@@ -71,6 +72,10 @@ load_dotenv(".env.local")
 # Map ELEVENLABS_API_KEY -> ELEVEN_API_KEY for plugin compatibility
 if not os.getenv("ELEVEN_API_KEY") and os.getenv("ELEVENLABS_API_KEY"):
     os.environ["ELEVEN_API_KEY"] = os.getenv("ELEVENLABS_API_KEY")
+
+# Map GEMINI_API_KEY -> GOOGLE_API_KEY for plugin compatibility
+if not os.getenv("GOOGLE_API_KEY") and os.getenv("GEMINI_API_KEY"):
+    os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY")
 
 # ── Firebase (call recordings + call records) ────────────────────────────
 FIREBASE_SERVICE_ACCOUNT_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "service_account.json")
@@ -182,24 +187,27 @@ async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
 # Azure isn't priced here: its plugins don't report model_provider/model_name
 # metadata the way the others do, and it's fallback-only so hasn't shown up
 # in a real usage entry yet to confirm the exact keys it would use.
-_OPENAI_GPT4O_INPUT_PER_TOKEN = 2.50 / 1_000_000
-_OPENAI_GPT4O_CACHED_INPUT_PER_TOKEN = 1.25 / 1_000_000
-_OPENAI_GPT4O_OUTPUT_PER_TOKEN = 10.00 / 1_000_000
+# Per-million-token OpenAI rates, keyed by model name.
+_OPENAI_TOKEN_RATES = {
+    "gpt-4o": {"input": 2.50, "cached_input": 1.25, "output": 10.00},
+    "gpt-5-mini": {"input": 0.25, "cached_input": 0.125, "output": 2.00},
+}
 _ELEVENLABS_FLASH_PER_CHARACTER = 0.05 / 1_000
 _DEEPGRAM_NOVA3_PER_SECOND = 0.0077 / 60
 
 
 def _estimate_entry_cost(entry: dict) -> float | None:
     provider, model = entry.get("provider"), entry.get("model")
-    if provider == "api.openai.com" and model == "gpt-4o":
+    if provider == "api.openai.com" and model in _OPENAI_TOKEN_RATES:
+        rates = _OPENAI_TOKEN_RATES[model]
         # input_tokens already includes input_cached_tokens as a subset —
         # only the non-cached remainder is billed at the full input rate.
         cached = entry.get("input_cached_tokens", 0)
         uncached = max(entry.get("input_tokens", 0) - cached, 0)
         return (
-            uncached * _OPENAI_GPT4O_INPUT_PER_TOKEN
-            + cached * _OPENAI_GPT4O_CACHED_INPUT_PER_TOKEN
-            + entry.get("output_tokens", 0) * _OPENAI_GPT4O_OUTPUT_PER_TOKEN
+            uncached * rates["input"] / 1_000_000
+            + cached * rates["cached_input"] / 1_000_000
+            + entry.get("output_tokens", 0) * rates["output"] / 1_000_000
         )
     if provider == "ElevenLabs" and model == "eleven_flash_v2_5":
         return entry.get("characters_count", 0) * _ELEVENLABS_FLASH_PER_CHARACTER
@@ -589,7 +597,15 @@ async def entrypoint(ctx: JobContext):
             azure.STT(),
         ]
     )
-    llm = openai.LLM(model="gpt-4o", temperature=0.1)
+    # LLM: Gemini 3.1 Flash Lite as primary, falling back to gpt-5-mini then
+    # gpt-4o (both OpenAI, existing key) if Gemini errors out mid-call.
+    llm = agents_llm.FallbackAdapter(
+        [
+            google.LLM(model="gemini-3.1-flash-lite", temperature=0.1),
+            openai.LLM(model="gpt-5-mini", temperature=0.1),
+            openai.LLM(model="gpt-4o", temperature=0.1),
+        ]
+    )
     vad = silero.VAD.load()
 
     # TTS: ElevenLabs as primary, Azure's Ezinne (Nigerian) voice as fallback
@@ -768,4 +784,4 @@ async def entrypoint(ctx: JobContext):
 
 if __name__ == "__main__":
     # Requires ELEVENLABS_API_KEY in .env.local (auto-mapped to ELEVEN_API_KEY)
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="fola"))
