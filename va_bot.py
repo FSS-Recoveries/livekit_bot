@@ -447,11 +447,17 @@ async def _wait_for_sip_participant(
 def _get_caller_phone_number(participant: "rtc.RemoteParticipant | None") -> str | None:
     """Extracts the customer's phone number from SIP participant attributes.
 
-    With includeHeaders=SIP_ALL_HEADERS on the inbound trunk, LiveKit maps
-    every INVITE header to a `sip.h.<lowercase-header-name>` attribute — so
-    the X-Caller-ID header set by the Asterisk dialplan lands on
-    "sip.h.x-caller-id". sip.phoneNumber is the DID (fromuser in the
-    dialplan), not the real caller, so it's only used as a last resort.
+    Our inbound trunk sets `"includeHeaders": "SIP_ALL_HEADERS"`, which maps
+    every INVITE header LiveKit sees onto a `sip.h.<lowercase-header-name>`
+    participant attribute. Our Asterisk dialplan sets an `X-Caller-ID` header
+    carrying the real customer number, so that lands on the attribute key
+    `sip.h.x-caller-id` — NOT `sip.headers.X-Caller-ID` / `X-Caller-ID`
+    (previous, incorrect keys).
+
+    `sip.phoneNumber` is only used as a last-resort fallback: on this setup
+    it reflects the dialplan's fixed `fromuser` (our own DID), not the actual
+    caller, because Asterisk relays every call into LiveKit under that same
+    From value.
     """
     if participant is None:
         return None
@@ -765,4 +771,10 @@ async def entrypoint(ctx: JobContext):
 
 if __name__ == "__main__":
     # Requires ELEVENLABS_API_KEY in .env.local (auto-mapped to ELEVEN_API_KEY)
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    #
+    # agent_name="fola" is required because the SIP dispatch rule
+    # (roomConfig.agents: [{"agentName": "fola"}]) uses explicit/named
+    # dispatch. Without a matching agent_name here, this worker only
+    # registers for automatic dispatch and never receives jobs from that
+    # rule — the dispatch name below must match the dispatch rule exactly.
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="fola"))
