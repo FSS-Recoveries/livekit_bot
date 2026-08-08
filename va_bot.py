@@ -4,9 +4,14 @@ import os
 import re
 import requests
 import inspect
+import time
+import uuid
+import wave
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from livekit import rtc
+from livekit import api as lk_api
 from livekit.agents import (
     AgentSession,
     Agent,
@@ -16,8 +21,22 @@ from livekit.agents import (
     cli,
     function_tool,
     RunContext,
+    get_job_context,
+    tts as agents_tts,
+    stt as agents_stt,
+    BackgroundAudioPlayer,
+    AudioConfig,
+    BuiltinAudioClip,
 )
-from livekit.plugins import deepgram, openai, silero, elevenlabs
+from livekit.agents.inference import TurnDetector
+from livekit.agents.metrics import ModelUsageCollector
+from livekit.plugins import deepgram, openai, silero, elevenlabs, noise_cancellation, azure
+from livekit.agents.voice.amd import AMD, AMDCategory
+
+import firebase_admin
+from firebase_admin import credentials as fb_credentials
+from firebase_admin import firestore as fb_firestore
+from firebase_admin import storage as fb_storage
 
 # ── Quick compat shim: Mp3StreamDecoder → AudioStreamDecoder ─────────────
 # Some livekit-agents versions removed Mp3StreamDecoder in favor of AudioStreamDecoder.
@@ -53,6 +72,192 @@ load_dotenv(".env.local")
 if not os.getenv("ELEVEN_API_KEY") and os.getenv("ELEVENLABS_API_KEY"):
     os.environ["ELEVEN_API_KEY"] = os.getenv("ELEVENLABS_API_KEY")
 
+# ── Firebase (call recordings + call records) ────────────────────────────
+FIREBASE_SERVICE_ACCOUNT_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "service_account.json")
+FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "fssspark.firebasestorage.app")
+RECORDINGS_FOLDER = "live_kit_calls"
+CALLS_COLLECTION = "live_kit_bot_calls"
+
+_firebase_app = None
+if os.path.exists(FIREBASE_SERVICE_ACCOUNT_PATH):
+    try:
+        _cred = fb_credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_PATH)
+        _firebase_app = firebase_admin.initialize_app(
+            _cred, {"storageBucket": FIREBASE_STORAGE_BUCKET}
+        )
+    except ValueError:
+        _firebase_app = firebase_admin.get_app()
+    except Exception as e:
+        print(f"Failed to initialize Firebase: {e}")
+else:
+    print(
+        f"No Firebase service account found at {FIREBASE_SERVICE_ACCOUNT_PATH}; "
+        "call recording/storage is disabled."
+    )
+
+
+def _load_gcp_credentials_json() -> str | None:
+    if not os.path.exists(FIREBASE_SERVICE_ACCOUNT_PATH):
+        return None
+    with open(FIREBASE_SERVICE_ACCOUNT_PATH, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+async def _start_call_recording(ctx: JobContext) -> "lk_api.EgressInfo | None":
+    """Records the call (audio-only) straight to Firebase Storage via LiveKit Egress."""
+    creds_json = _load_gcp_credentials_json()
+    if not creds_json:
+        return None
+    req = lk_api.RoomCompositeEgressRequest(
+        room_name=ctx.room.name,
+        audio_only=True,
+        file_outputs=[
+            lk_api.EncodedFileOutput(
+                file_type=lk_api.EncodedFileType.OGG,
+                filepath=f"{RECORDINGS_FOLDER}/{ctx.room.name}.ogg",
+                gcp=lk_api.GCPUpload(credentials=creds_json, bucket=FIREBASE_STORAGE_BUCKET),
+            )
+        ],
+    )
+    try:
+        return await ctx.api.egress.start_room_composite_egress(req)
+    except Exception as e:
+        print(f"Failed to start call recording: {e}")
+        return None
+
+
+async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
+    """Stops egress, waits for the upload to finish, and returns a Firebase download URL."""
+    if egress_info is None or _firebase_app is None:
+        return None
+    try:
+        await ctx.api.egress.stop_egress(lk_api.StopEgressRequest(egress_id=egress_info.egress_id))
+    except Exception as e:
+        print(f"Failed to stop call recording: {e}")
+        return None
+
+    # Egress finalizes and uploads the file asynchronously after stop; poll briefly.
+    for _ in range(15):
+        await asyncio.sleep(2)
+        try:
+            resp = await ctx.api.egress.list_egress(
+                lk_api.ListEgressRequest(egress_id=egress_info.egress_id)
+            )
+        except Exception as e:
+            print(f"Failed to poll call recording status: {e}")
+            return None
+        if not resp.items:
+            return None
+        info = resp.items[0]
+        if info.status == lk_api.EgressStatus.EGRESS_COMPLETE:
+            break
+        if info.status in (lk_api.EgressStatus.EGRESS_FAILED, lk_api.EgressStatus.EGRESS_ABORTED):
+            print(f"Call recording failed: {info.error}")
+            return None
+    else:
+        print("Timed out waiting for call recording to finish uploading.")
+        return None
+
+    filepath = f"{RECORDINGS_FOLDER}/{ctx.room.name}.ogg"
+    try:
+        bucket = fb_storage.bucket()
+        blob = bucket.blob(filepath)
+        token = str(uuid.uuid4())
+        blob.metadata = {"firebaseStorageDownloadTokens": token}
+        blob.patch()
+        encoded_path = filepath.replace("/", "%2F")
+        return (
+            f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_STORAGE_BUCKET}"
+            f"/o/{encoded_path}?alt=media&token={token}"
+        )
+    except Exception as e:
+        print(f"Failed to finalize call recording URL: {e}")
+        return None
+
+
+# Approximate USD rates per provider/model, from each provider's public
+# pricing page as of 2026-08-08. These are ESTIMATES for internal cost
+# tracking only — always reconcile against actual provider invoices, since
+# rates change and this doesn't account for volume/commitment discounts.
+# Azure isn't priced here: its plugins don't report model_provider/model_name
+# metadata the way the others do, and it's fallback-only so hasn't shown up
+# in a real usage entry yet to confirm the exact keys it would use.
+_OPENAI_GPT4O_INPUT_PER_TOKEN = 2.50 / 1_000_000
+_OPENAI_GPT4O_CACHED_INPUT_PER_TOKEN = 1.25 / 1_000_000
+_OPENAI_GPT4O_OUTPUT_PER_TOKEN = 10.00 / 1_000_000
+_ELEVENLABS_FLASH_PER_CHARACTER = 0.05 / 1_000
+_DEEPGRAM_NOVA3_PER_SECOND = 0.0077 / 60
+
+
+def _estimate_entry_cost(entry: dict) -> float | None:
+    provider, model = entry.get("provider"), entry.get("model")
+    if provider == "api.openai.com" and model == "gpt-4o":
+        # input_tokens already includes input_cached_tokens as a subset —
+        # only the non-cached remainder is billed at the full input rate.
+        cached = entry.get("input_cached_tokens", 0)
+        uncached = max(entry.get("input_tokens", 0) - cached, 0)
+        return (
+            uncached * _OPENAI_GPT4O_INPUT_PER_TOKEN
+            + cached * _OPENAI_GPT4O_CACHED_INPUT_PER_TOKEN
+            + entry.get("output_tokens", 0) * _OPENAI_GPT4O_OUTPUT_PER_TOKEN
+        )
+    if provider == "ElevenLabs" and model == "eleven_flash_v2_5":
+        return entry.get("characters_count", 0) * _ELEVENLABS_FLASH_PER_CHARACTER
+    if provider == "Deepgram" and model == "nova-3":
+        return entry.get("audio_duration", 0) * _DEEPGRAM_NOVA3_PER_SECOND
+    return None
+
+
+def _add_estimated_costs(usage: list) -> tuple[list, float]:
+    """Annotates each usage entry with an estimated_cost_usd and returns the
+    enriched list alongside the total. Entries with no known pricing (e.g.
+    Azure fallback, LiveKit's own interruption/turn-detector usage) are left
+    with estimated_cost_usd=None rather than guessed."""
+    total = 0.0
+    enriched = []
+    for entry in usage:
+        entry = dict(entry)
+        cost = _estimate_entry_cost(entry)
+        if cost is not None:
+            total += cost
+        entry["estimated_cost_usd"] = round(cost, 6) if cost is not None else None
+        enriched.append(entry)
+    return enriched, round(total, 6)
+
+
+def _save_call_record(
+    room_name: str,
+    transcript_lines: list,
+    amd_category,
+    recording_url,
+    started_at: datetime,
+    duration_seconds: float,
+    usage: list,
+    phone_number: str | None,
+) -> None:
+    if _firebase_app is None:
+        return
+    usage, total_estimated_cost_usd = _add_estimated_costs(usage)
+    try:
+        db = fb_firestore.client()
+        db.collection(CALLS_COLLECTION).document(room_name).set(
+            {
+                "room_name": room_name,
+                "phone_number": phone_number,
+                "transcript": "\n".join(transcript_lines),
+                "amd_category": amd_category,
+                "recording_url": recording_url,
+                "started_at": started_at,
+                "duration_seconds": round(duration_seconds, 1),
+                "usage": usage,
+                "total_estimated_cost_usd": total_estimated_cost_usd,
+                "ended_at": fb_firestore.SERVER_TIMESTAMP,
+            }
+        )
+    except Exception as e:
+        print(f"Failed to save call record to Firestore: {e}")
+
+
 # ── Function tools ──────────────────────────────────────────────────────
 def _normalize_nigerian_phone(raw: str) -> str:
     """Strip non-digits, then convert 234XXXXXXXXXX → 0XXXXXXXXX."""
@@ -60,6 +265,21 @@ def _normalize_nigerian_phone(raw: str) -> str:
     if digits.startswith("234"):
         digits = "0" + digits[3:]
     return digits
+
+
+async def _fetch_customer_snapshot(phone_number: str) -> dict:
+    """Fetches the customer snapshot for a (Nigerian-normalized) phone number.
+
+    Raises requests.HTTPError/RequestException on failure — callers decide
+    how to handle that. The blocking `requests` call is offloaded to a
+    thread so this can run concurrently with other async work (e.g. the
+    greeting WAV playing, or provider setup).
+    """
+    normalized = _normalize_nigerian_phone(phone_number)
+    url = f"https://fss-api.onrender.com/customer_snapshot/{normalized}"
+    resp = await asyncio.to_thread(requests.get, url, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
 
 
 @function_tool(
@@ -72,13 +292,11 @@ def _normalize_nigerian_phone(raw: str) -> str:
 )
 async def get_customer_info(ctx: RunContext, phone_number: str) -> str:
     normalized = _normalize_nigerian_phone(phone_number)
-    url = f"https://fss-api.onrender.com/customer_snapshot/{normalized}"
     try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        first_name = data.get("first_name", "")
-        last_name = data.get("surname", "")
+        data = await _fetch_customer_snapshot(phone_number)
+        active_lead = data.get("active_lead") or {}
+        first_name = active_lead.get("first_name", "")
+        last_name = active_lead.get("surname", "")
         return (
             f"Customer found. first_name={first_name}, last_name={last_name}. "
             f"Full response: {data}"
@@ -91,43 +309,18 @@ async def get_customer_info(ctx: RunContext, phone_number: str) -> str:
         return f"Error fetching customer info: {e}"
 
 
-@function_tool(description="Schedule a payment-plan link or instructions to the provided email.")
-async def schedule_payment_plan(ctx: RunContext, email: str, name: str, amount: float) -> str:
-    if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
-        return "The email address appears invalid."
-    webhook = os.getenv("PAYMENT_PLAN_WEBHOOK_URL")
-    if not webhook:
-        return "Payment plan service unavailable."
-    try:
-        resp = requests.post(
-            webhook,
-            json={"email": email, "name": name, "amount": amount},
-            headers={"Content-Type": "application/json"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return f"A payment plan has been scheduled. Check your email at {email}."
-    except requests.RequestException:
-        return "Error scheduling the payment plan; please try again later."
-
-
-@function_tool(description="Check account status by email and prompt for payment plan if delinquent.")
-async def check_account_status(ctx: RunContext, email: str) -> str:
-    token = os.getenv("API_TOKEN")
-    url = os.getenv("ACCOUNT_STATUS_ENDPOINT")
-    try:
-        resp = requests.get(
-            f"{url}?email={email}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("status") == "delinquent":
-            return "Your account is delinquent. Would you like to schedule a payment plan?"
-        return "Your account is in good standing."
-    except requests.RequestException:
-        return "Error checking account status; please try again later."
+@function_tool(
+    description=(
+        "End the call and hang up. Call this whenever the prompt instructs you to "
+        "'stop completely' — after your final spoken message, a dead-end exit, or an "
+        "escalation close. Always speak your closing message first; this tool waits "
+        "for it to finish playing before disconnecting, so it is safe to call "
+        "immediately after your final message."
+    )
+)
+async def end_call(ctx: RunContext) -> None:
+    await ctx.wait_for_playout()
+    get_job_context().shutdown(reason="call ended by agent")
 
 
 # ── Version-safe ElevenLabs TTS builder ─────────────────────────────────
@@ -236,10 +429,149 @@ def build_elevenlabs_tts():
     return elevenlabs.TTS(**tts_kwargs)
 
 
+# ── SIP participant + caller phone number ────────────────────────────────
+async def _wait_for_sip_participant(
+    room: rtc.Room, timeout: float = 10.0
+) -> rtc.RemoteParticipant | None:
+    """Waits for the SIP participant to join. On outbound calls the
+    participant may not be present immediately after connect()."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        for participant in room.remote_participants.values():
+            if participant.attributes.get("sip.callID"):
+                return participant
+        await asyncio.sleep(0.2)
+    return None
+
+
+def _get_caller_phone_number(participant: "rtc.RemoteParticipant | None") -> str | None:
+    """Extracts the customer's phone number from SIP participant attributes.
+
+    sip.phoneNumber reflects our own DID on outbound calls, not the customer
+    — the actual customer number is passed via the X-Caller-ID SIP header
+    set in the dialplan. The exact attribute key LiveKit exposes for custom
+    SIP headers is unverified against our real trunk; this logs the full
+    attribute set (see entrypoint) so it can be confirmed/adjusted from a
+    real test call.
+    """
+    if participant is None:
+        return None
+    phone_number = participant.attributes.get(
+        "sip.headers.X-Caller-ID"
+    ) or participant.attributes.get("X-Caller-ID")
+    if phone_number:
+        return phone_number.strip()
+    return participant.attributes.get("sip.phoneNumber")
+
+
+# ── Pre-recorded greeting (bypasses TTS) ─────────────────────────────────
+GREETING_WAV_PATH = os.path.join(os.getcwd(), "Greeting.wav")
+
+
+async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
+    """Publishes a pre-recorded WAV directly to the room as a raw audio
+    track, bypassing TTS entirely. Avoids TTS cold-start latency (and any
+    single provider's outage) for this one fixed opening line. The agent
+    stays silent until the caller actually replies, since nothing here
+    touches the LLM/STT turn-taking pipeline."""
+    if not os.path.exists(wav_path):
+        print(f"Greeting WAV not found at {wav_path}; skipping.")
+        return
+
+    with wave.open(wav_path, "rb") as wf:
+        sample_rate = wf.getframerate()
+        num_channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        if sample_width != 2:
+            print(f"Greeting WAV must be 16-bit PCM, got {sample_width * 8}-bit; skipping.")
+            return
+
+        source = rtc.AudioSource(sample_rate, num_channels)
+        track = rtc.LocalAudioTrack.create_audio_track("greeting", source)
+        publication = await room.local_participant.publish_track(track)
+
+        frame_ms = 20
+        frame_samples = int(sample_rate * frame_ms / 1000)
+        bytes_per_frame = frame_samples * num_channels * sample_width
+
+        try:
+            while True:
+                chunk = wf.readframes(frame_samples)
+                if not chunk:
+                    break
+                if len(chunk) < bytes_per_frame:
+                    chunk += b"\x00" * (bytes_per_frame - len(chunk))
+                audio_frame = rtc.AudioFrame(
+                    data=chunk,
+                    sample_rate=sample_rate,
+                    num_channels=num_channels,
+                    samples_per_channel=len(chunk) // (2 * num_channels),
+                )
+                await source.capture_frame(audio_frame)
+        finally:
+            await asyncio.sleep(0.5)
+            await room.local_participant.unpublish_track(publication.sid)
+
+
 # ── Entrypoint ──────────────────────────────────────────────────────────
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
     print(f"Connected to room {ctx.room.name}")
+
+    is_console = ctx.room.name == "console" or ctx.room.name.startswith("console-")
+
+    # Call recording + transcript storage (Firebase). Started immediately so
+    # nothing is missed, including the AMD greeting-classification window.
+    call_started_at = time.time()
+    call_state = {"amd_category": None}
+    transcript_lines: list[str] = []
+    egress_info = await _start_call_recording(ctx)
+
+    async def _on_shutdown():
+        # ctx.shutdown() (used everywhere we decide to end the call) only
+        # disconnects our own agent from the room — it does NOT hang up the
+        # actual phone call. The SIP participant stays connected with dead
+        # air unless the room itself is deleted. Do this first, immediately,
+        # rather than after the (up to ~30s) recording finalization below,
+        # so the customer's line actually drops the moment the agent decides
+        # to end the call. No-ops safely in console mode.
+        try:
+            await ctx.delete_room()
+        except Exception as e:
+            print(f"Failed to delete room / hang up call: {e}")
+
+        recording_url = await _finish_call_recording(ctx, egress_info)
+        usage = [u.model_dump(mode="json") for u in usage_collector.flatten()]
+        _save_call_record(
+            ctx.room.name,
+            transcript_lines,
+            call_state["amd_category"],
+            recording_url,
+            datetime.fromtimestamp(call_started_at, tz=timezone.utc),
+            time.time() - call_started_at,
+            usage,
+            phone_number,
+        )
+
+    ctx.add_shutdown_callback(_on_shutdown)
+
+    # SIP participant + caller phone number. Skipped in console mode: no SIP
+    # participant will ever join a local mic-test session.
+    sip_participant = None
+    phone_number = None
+    lookup_task = None
+    if not is_console:
+        sip_participant = await _wait_for_sip_participant(ctx.room)
+        if sip_participant:
+            print(f"SIP participant joined: {sip_participant.identity}")
+            print(f"Participant attributes: {dict(sip_participant.attributes)}")
+            phone_number = _get_caller_phone_number(sip_participant)
+        else:
+            print("Warning: no SIP participant found within timeout")
+        print(f"Customer phone number: {phone_number}")
+
+        if phone_number:
+            lookup_task = asyncio.create_task(_fetch_customer_snapshot(phone_number))
 
     # Load system prompt (fallback if file missing)
     prompt_path = os.path.join(os.getcwd(), "prompt.txt")
@@ -250,10 +582,28 @@ async def entrypoint(ctx: JobContext):
         system_prompt = "You are Kolawole, a debt collection assistant."
 
     # Providers
-    stt = deepgram.STT(model="nova-3")
+    # STT: Deepgram as primary, Azure as fallback if Deepgram errors out mid-call.
+    stt = agents_stt.FallbackAdapter(
+        [
+            deepgram.STT(model="nova-3"),
+            azure.STT(),
+        ]
+    )
     llm = openai.LLM(model="gpt-4o", temperature=0.1)
     vad = silero.VAD.load()
-    tts = build_elevenlabs_tts()
+
+    # TTS: ElevenLabs as primary, Azure's Ezinne (Nigerian) voice as fallback
+    # if ElevenLabs errors out mid-call.
+    tts = agents_tts.FallbackAdapter(
+        [
+            build_elevenlabs_tts(),
+            azure.TTS(voice="en-NG-EzinneNeural"),
+        ]
+    )
+
+    # Usage metrics (LLM tokens, TTS characters, STT audio seconds), broken
+    # down per provider/model — persisted to the call's Firestore record.
+    usage_collector = ModelUsageCollector()
 
     # Session
     session = AgentSession(
@@ -261,25 +611,155 @@ async def entrypoint(ctx: JobContext):
         llm=llm,
         vad=vad,
         tts=tts,
+        turn_detection=TurnDetector(),
+        preemptive_generation=True,
     )
+
+    # session.emit("metrics_collected", MetricsCollectedEvent(metrics=...)) wraps
+    # the metrics — ModelUsageCollector.collect() expects the raw metrics object,
+    # so it must be unwrapped here or every call silently no-ops.
+    session.on("metrics_collected", lambda ev: usage_collector.collect(ev.metrics))
+
+    def _on_conversation_item_added(ev):
+        item = ev.item
+        role = getattr(item, "role", None)
+        text = getattr(item, "text_content", None)
+        if role and text:
+            transcript_lines.append(f"{role}: {text}")
+
+    session.on("conversation_item_added", _on_conversation_item_added)
+
+    # Resolve the customer lookup kicked off right after connecting — it's
+    # been running concurrently with provider setup above, so it's likely
+    # already done. Inject the result into the instructions so the model
+    # doesn't need to call get_customer_info itself for this call.
+    customer_data = None
+    if lookup_task:
+        try:
+            customer_data = await asyncio.wait_for(lookup_task, timeout=3)
+        except (asyncio.TimeoutError, requests.RequestException) as e:
+            print(f"Customer lookup failed or timed out: {e}")
+
+    if customer_data:
+        active_lead = customer_data.get("active_lead") or {}
+        system_prompt += (
+            f"\n\nThe customer has already been identified as "
+            f"{active_lead.get('first_name', '')} {active_lead.get('surname', '')} "
+            f"(phone: {phone_number}). Full customer data: {customer_data}. "
+            f"You do not need to call get_customer_info again unless the details seem wrong."
+        )
+    elif phone_number:
+        system_prompt += (
+            f"\n\nThe customer's phone number is {phone_number} but their account "
+            f"could not be retrieved automatically. Call get_customer_info with "
+            f"{phone_number} before proceeding."
+        )
+    elif not is_console:
+        system_prompt += (
+            "\n\nThe customer's phone number is not available. Ask the customer for their "
+            "phone number, then call get_customer_info to look up their account."
+        )
 
     # Agent with tools
     agent = Agent(
         instructions=system_prompt,
-        tools=[get_customer_info, schedule_payment_plan, check_account_status],
+        tools=[get_customer_info, end_call],
     )
 
     # Start
+    # BVCTelephony is tuned for the narrow, compressed audio band of real
+    # phone calls (SIP); plain BVC is tuned for regular WebRTC audio and
+    # doesn't filter phone-call background noise well. Only a real SIP call
+    # gets BVCTelephony — console and Playground/WebRTC testing keep BVC.
+    noise_cancellation_model = (
+        noise_cancellation.BVCTelephony() if sip_participant else noise_cancellation.BVC()
+    )
     await session.start(
         room=ctx.room,
         agent=agent,
-        room_input_options=RoomInputOptions(noise_cancellation=None),
+        room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation_model),
     )
 
-    await session.say(
-        "Hello, how can I assist you with your account today?",
-        allow_interruptions=True,
+    # Background ambient office noise so Fola sounds like a real call-center
+    # agent rather than speaking from a silent void.
+    background_audio = BackgroundAudioPlayer(
+        ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.3),
     )
+    await background_audio.start(room=ctx.room, agent_session=session)
+
+    # Answering Machine Detection: classify the start of the call before
+    # committing to the live opening line, so we don't talk over a voicemail
+    # greeting or waste it on an unreachable mailbox. Reuses our own LLM/STT
+    # so classification stays on our existing OpenAI/Deepgram keys rather
+    # than LiveKit's separate inference gateway.
+    #
+    # Skipped for `console` mode: there's no answering-machine scenario when
+    # testing with your own mic, and AMD has no real SIP participant to
+    # classify there anyway. `wait_until_finished=False` caps detection at
+    # the 20s timeout even if the caller talks continuously without a clean
+    # pause — otherwise AMD extends indefinitely waiting for silence and the
+    # greeting never fires.
+    if ctx.room.name == "console" or ctx.room.name.startswith("console-"):
+        result = None
+        call_state["amd_category"] = "skipped_console"
+    else:
+        async with AMD(
+            session,
+            llm=llm,
+            stt=stt,
+            suppress_compatibility_warning=True,
+            wait_until_finished=False,
+        ) as detector:
+            result = await detector.execute()
+        call_state["amd_category"] = result.category.value
+
+    if result is not None and result.category == AMDCategory.MACHINE_VM:
+        ctx.shutdown(reason="voicemail detected")
+        return
+    elif result is not None and result.category == AMDCategory.MACHINE_UNAVAILABLE:
+        ctx.shutdown(reason="mailbox unavailable")
+        return
+    elif result is not None and result.category == AMDCategory.MACHINE_IVR:
+        # AMD's built-in IVR navigation already kicked off inside execute();
+        # nothing further to do here.
+        pass
+    elif is_console:
+        # Console mode has no SIP participant/greeting WAV workflow — keep
+        # the simple TTS line for local mic testing.
+        await session.say(
+            "Hello, how can I assist you with your account today?",
+            allow_interruptions=True,
+        )
+    else:
+        # Human or uncertain: play the pre-recorded greeting instead of TTS
+        # (avoids TTS cold-start latency and any single provider's outage
+        # for this one fixed line). Nothing is said after this — the LLM
+        # only fires once STT/VAD detects the caller's reply, so the agent
+        # naturally stays silent until they actually respond, then follows
+        # the prompt's own Opening Flow script via normal TTS.
+        await _play_wav_greeting(ctx.room, GREETING_WAV_PATH)
+
+    # Silence safety net: the LLM only reacts to turns, so if the customer
+    # goes quiet it can't act on its own. After user_away_timeout (15s
+    # default) of no user activity, check in once per the prompt's silence
+    # rule; if they're still away after a second consecutive check, hang up
+    # instead of holding the line open indefinitely.
+    checked_in = False
+
+    def _on_user_state_changed(ev):
+        nonlocal checked_in
+        if ev.new_state != "away":
+            checked_in = False
+            return
+        if not checked_in:
+            checked_in = True
+            asyncio.create_task(
+                session.say("Are you still with me?", allow_interruptions=True)
+            )
+        else:
+            ctx.shutdown(reason="no response after silence check")
+
+    session.on("user_state_changed", _on_user_state_changed)
 
     # Keep alive
     while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
