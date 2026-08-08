@@ -447,18 +447,15 @@ async def _wait_for_sip_participant(
 def _get_caller_phone_number(participant: "rtc.RemoteParticipant | None") -> str | None:
     """Extracts the customer's phone number from SIP participant attributes.
 
-    sip.phoneNumber reflects our own DID on outbound calls, not the customer
-    — the actual customer number is passed via the X-Caller-ID SIP header
-    set in the dialplan. The exact attribute key LiveKit exposes for custom
-    SIP headers is unverified against our real trunk; this logs the full
-    attribute set (see entrypoint) so it can be confirmed/adjusted from a
-    real test call.
+    With includeHeaders=SIP_ALL_HEADERS on the inbound trunk, LiveKit maps
+    every INVITE header to a `sip.h.<lowercase-header-name>` attribute — so
+    the X-Caller-ID header set by the Asterisk dialplan lands on
+    "sip.h.x-caller-id". sip.phoneNumber is the DID (fromuser in the
+    dialplan), not the real caller, so it's only used as a last resort.
     """
     if participant is None:
         return None
-    phone_number = participant.attributes.get(
-        "sip.headers.X-Caller-ID"
-    ) or participant.attributes.get("X-Caller-ID")
+    phone_number = participant.attributes.get("sip.h.x-caller-id")
     if phone_number:
         return phone_number.strip()
     return participant.attributes.get("sip.phoneNumber")
