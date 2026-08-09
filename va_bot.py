@@ -177,30 +177,48 @@ async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
 
 
 # Approximate USD rates per provider/model, from each provider's public
-# pricing page as of 2026-08-08. These are ESTIMATES for internal cost
+# pricing page as of 2026-08-09. These are ESTIMATES for internal cost
 # tracking only — always reconcile against actual provider invoices, since
 # rates change and this doesn't account for volume/commitment discounts.
 # Azure isn't priced here: its plugins don't report model_provider/model_name
 # metadata the way the others do, and it's fallback-only so hasn't shown up
 # in a real usage entry yet to confirm the exact keys it would use.
-_OPENAI_GPT4O_INPUT_PER_TOKEN = 2.50 / 1_000_000
-_OPENAI_GPT4O_CACHED_INPUT_PER_TOKEN = 1.25 / 1_000_000
-_OPENAI_GPT4O_OUTPUT_PER_TOKEN = 10.00 / 1_000_000
+#
+# Gemini 3.1 Flash-Lite is matched on `model` alone (no `provider` check,
+# unlike the OpenAI/ElevenLabs/Deepgram entries below) — the exact
+# `provider` string the Google plugin reports for its usage metrics hasn't
+# been confirmed against a real call. If estimated_cost_usd comes back None
+# for Gemini usage entries, check a real usage dict's `provider` value and
+# add that condition back for a tighter match.
+_GEMINI_FLASH_LITE_INPUT_PER_TOKEN = 0.25 / 1_000_000
+_GEMINI_FLASH_LITE_CACHED_INPUT_PER_TOKEN = 0.025 / 1_000_000
+_GEMINI_FLASH_LITE_OUTPUT_PER_TOKEN = 1.50 / 1_000_000  # includes thinking tokens
+_GPT5_MINI_INPUT_PER_TOKEN = 0.25 / 1_000_000
+_GPT5_MINI_CACHED_INPUT_PER_TOKEN = 0.025 / 1_000_000
+_GPT5_MINI_OUTPUT_PER_TOKEN = 2.00 / 1_000_000
 _ELEVENLABS_FLASH_PER_CHARACTER = 0.05 / 1_000
 _DEEPGRAM_NOVA3_PER_SECOND = 0.0077 / 60
 
 
 def _estimate_entry_cost(entry: dict) -> float | None:
     provider, model = entry.get("provider"), entry.get("model")
-    if provider == "api.openai.com" and model == "gpt-4o":
+    if model == "gemini-3.1-flash-lite":
         # input_tokens already includes input_cached_tokens as a subset —
         # only the non-cached remainder is billed at the full input rate.
         cached = entry.get("input_cached_tokens", 0)
         uncached = max(entry.get("input_tokens", 0) - cached, 0)
         return (
-            uncached * _OPENAI_GPT4O_INPUT_PER_TOKEN
-            + cached * _OPENAI_GPT4O_CACHED_INPUT_PER_TOKEN
-            + entry.get("output_tokens", 0) * _OPENAI_GPT4O_OUTPUT_PER_TOKEN
+            uncached * _GEMINI_FLASH_LITE_INPUT_PER_TOKEN
+            + cached * _GEMINI_FLASH_LITE_CACHED_INPUT_PER_TOKEN
+            + entry.get("output_tokens", 0) * _GEMINI_FLASH_LITE_OUTPUT_PER_TOKEN
+        )
+    if provider == "api.openai.com" and model == "gpt-5-mini":
+        cached = entry.get("input_cached_tokens", 0)
+        uncached = max(entry.get("input_tokens", 0) - cached, 0)
+        return (
+            uncached * _GPT5_MINI_INPUT_PER_TOKEN
+            + cached * _GPT5_MINI_CACHED_INPUT_PER_TOKEN
+            + entry.get("output_tokens", 0) * _GPT5_MINI_OUTPUT_PER_TOKEN
         )
     if provider == "ElevenLabs" and model == "eleven_flash_v2_5":
         return entry.get("characters_count", 0) * _ELEVENLABS_FLASH_PER_CHARACTER
@@ -598,14 +616,15 @@ async def entrypoint(ctx: JobContext):
             azure.STT(),
         ]
     )
-    # LLM: Gemini 2.5 Flash-Lite as primary, gpt-5-mini as fallback if
+    # LLM: Gemini 3.1 Flash-Lite as primary, gpt-5-mini as fallback if
     # Gemini errors out. Worth knowing: Gemini 2.5 (Flash and Flash-Lite) has
     # a documented upstream quirk where it can return finish_reason=STOP
     # with no actual text/candidates — most commonly reported with
-    # tool-calling agents like this one. When the plugin surfaces that as an
-    # error, this fallback catches it; if it doesn't raise (silently empty
-    # instead), this won't help and you'd want to drop Gemini entirely at
-    # that point.
+    # tool-calling agents like this one. Not independently confirmed on
+    # 3.1 specifically, but keeping the fallback below either way. When the
+    # plugin surfaces that as an error, this fallback catches it; if it
+    # doesn't raise (silently empty instead), this won't help and you'd
+    # want to drop Gemini entirely at that point.
     #
     # gpt-5-mini: GPT-5-series models reject a custom `temperature` entirely
     # (400 error unless left at the API default of 1), so it's omitted here,
@@ -620,7 +639,7 @@ async def entrypoint(ctx: JobContext):
     # pass api_key= directly here.
     llm = agents_llm.FallbackAdapter(
         [
-            google.LLM(model="gemini-2.5-flash-lite", temperature=0.1),
+            google.LLM(model="gemini-3.1-flash-lite", temperature=0.1),
             openai.LLM(model="gpt-5-mini"),
         ]
     )
