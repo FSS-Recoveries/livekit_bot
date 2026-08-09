@@ -24,13 +24,14 @@ from livekit.agents import (
     get_job_context,
     tts as agents_tts,
     stt as agents_stt,
+    llm as agents_llm,
     BackgroundAudioPlayer,
     AudioConfig,
     BuiltinAudioClip,
 )
 from livekit.agents.inference import TurnDetector
 from livekit.agents.metrics import ModelUsageCollector
-from livekit.plugins import deepgram, silero, elevenlabs, noise_cancellation, azure, google
+from livekit.plugins import deepgram, openai, silero, elevenlabs, noise_cancellation, azure, google
 from livekit.agents.voice.amd import AMD, AMDCategory
 
 import firebase_admin
@@ -597,9 +598,32 @@ async def entrypoint(ctx: JobContext):
             azure.STT(),
         ]
     )
+    # LLM: Gemini 2.5 Flash-Lite as primary, gpt-5-mini as fallback if
+    # Gemini errors out. Worth knowing: Gemini 2.5 (Flash and Flash-Lite) has
+    # a documented upstream quirk where it can return finish_reason=STOP
+    # with no actual text/candidates — most commonly reported with
+    # tool-calling agents like this one. When the plugin surfaces that as an
+    # error, this fallback catches it; if it doesn't raise (silently empty
+    # instead), this won't help and you'd want to drop Gemini entirely at
+    # that point.
+    #
+    # gpt-5-mini: GPT-5-series models reject a custom `temperature` entirely
+    # (400 error unless left at the API default of 1), so it's omitted here,
+    # unlike Gemini above. reasoning_effort is also left unset — the plugin
+    # applies a safe default automatically for GPT-5 models, and explicit
+    # reasoning_effort combined with function tools (get_customer_info,
+    # end_call) has been reported to 400 on the Chat Completions endpoint
+    # for at least one GPT-5.x variant — not confirmed for gpt-5-mini
+    # specifically, but not worth risking on a fallback path.
+    #
     # Requires GOOGLE_API_KEY in the environment (Google AI Studio key), or
     # pass api_key= directly here.
-    llm = google.LLM(model="gemini-2.5-flash-lite", temperature=0.1)
+    llm = agents_llm.FallbackAdapter(
+        [
+            google.LLM(model="gemini-2.5-flash-lite", temperature=0.1),
+            openai.LLM(model="gpt-5-mini"),
+        ]
+    )
     # Loaded once per worker process in prewarm(), not per call — silero
     # model load is one of the bigger contributors to pre-greeting delay
     # when done fresh on every call.
