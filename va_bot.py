@@ -24,14 +24,13 @@ from livekit.agents import (
     get_job_context,
     tts as agents_tts,
     stt as agents_stt,
-    llm as agents_llm,
     BackgroundAudioPlayer,
     AudioConfig,
     BuiltinAudioClip,
 )
 from livekit.agents.inference import TurnDetector
 from livekit.agents.metrics import ModelUsageCollector
-from livekit.plugins import deepgram, openai, silero, elevenlabs, noise_cancellation, azure, google
+from livekit.plugins import deepgram, openai, silero, elevenlabs, noise_cancellation, azure
 from livekit.agents.voice.amd import AMD, AMDCategory
 
 import firebase_admin
@@ -72,10 +71,6 @@ load_dotenv(".env.local")
 # Map ELEVENLABS_API_KEY -> ELEVEN_API_KEY for plugin compatibility
 if not os.getenv("ELEVEN_API_KEY") and os.getenv("ELEVENLABS_API_KEY"):
     os.environ["ELEVEN_API_KEY"] = os.getenv("ELEVENLABS_API_KEY")
-
-# Map GEMINI_API_KEY -> GOOGLE_API_KEY for plugin compatibility
-if not os.getenv("GOOGLE_API_KEY") and os.getenv("GEMINI_API_KEY"):
-    os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY")
 
 # ── Firebase (call recordings + call records) ────────────────────────────
 FIREBASE_SERVICE_ACCOUNT_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "service_account.json")
@@ -187,27 +182,24 @@ async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
 # Azure isn't priced here: its plugins don't report model_provider/model_name
 # metadata the way the others do, and it's fallback-only so hasn't shown up
 # in a real usage entry yet to confirm the exact keys it would use.
-# Per-million-token OpenAI rates, keyed by model name.
-_OPENAI_TOKEN_RATES = {
-    "gpt-4o": {"input": 2.50, "cached_input": 1.25, "output": 10.00},
-    "gpt-5-mini": {"input": 0.25, "cached_input": 0.125, "output": 2.00},
-}
+_OPENAI_GPT4O_INPUT_PER_TOKEN = 2.50 / 1_000_000
+_OPENAI_GPT4O_CACHED_INPUT_PER_TOKEN = 1.25 / 1_000_000
+_OPENAI_GPT4O_OUTPUT_PER_TOKEN = 10.00 / 1_000_000
 _ELEVENLABS_FLASH_PER_CHARACTER = 0.05 / 1_000
 _DEEPGRAM_NOVA3_PER_SECOND = 0.0077 / 60
 
 
 def _estimate_entry_cost(entry: dict) -> float | None:
     provider, model = entry.get("provider"), entry.get("model")
-    if provider == "api.openai.com" and model in _OPENAI_TOKEN_RATES:
-        rates = _OPENAI_TOKEN_RATES[model]
+    if provider == "api.openai.com" and model == "gpt-4o":
         # input_tokens already includes input_cached_tokens as a subset —
         # only the non-cached remainder is billed at the full input rate.
         cached = entry.get("input_cached_tokens", 0)
         uncached = max(entry.get("input_tokens", 0) - cached, 0)
         return (
-            uncached * rates["input"] / 1_000_000
-            + cached * rates["cached_input"] / 1_000_000
-            + entry.get("output_tokens", 0) * rates["output"] / 1_000_000
+            uncached * _OPENAI_GPT4O_INPUT_PER_TOKEN
+            + cached * _OPENAI_GPT4O_CACHED_INPUT_PER_TOKEN
+            + entry.get("output_tokens", 0) * _OPENAI_GPT4O_OUTPUT_PER_TOKEN
         )
     if provider == "ElevenLabs" and model == "eleven_flash_v2_5":
         return entry.get("characters_count", 0) * _ELEVENLABS_FLASH_PER_CHARACTER
@@ -531,12 +523,16 @@ async def entrypoint(ctx: JobContext):
 
     is_console = ctx.room.name == "console" or ctx.room.name.startswith("console-")
 
-    # Call recording + transcript storage (Firebase). Started immediately so
-    # nothing is missed, including the AMD greeting-classification window.
+    # Call recording + transcript storage (Firebase). Kicked off as a
+    # background task (not awaited here) so the network round-trip to the
+    # Egress API doesn't block everything downstream — SIP participant wait,
+    # provider setup, AMD, and the greeting — from starting immediately.
+    # Recording doesn't gate any of that; it's only actually needed later,
+    # in _on_shutdown.
     call_started_at = time.time()
     call_state = {"amd_category": None}
     transcript_lines: list[str] = []
-    egress_info = await _start_call_recording(ctx)
+    egress_task = asyncio.create_task(_start_call_recording(ctx))
 
     async def _on_shutdown():
         # ctx.shutdown() (used everywhere we decide to end the call) only
@@ -551,6 +547,7 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             print(f"Failed to delete room / hang up call: {e}")
 
+        egress_info = await egress_task
         recording_url = await _finish_call_recording(ctx, egress_info)
         usage = [u.model_dump(mode="json") for u in usage_collector.flatten()]
         _save_call_record(
@@ -600,16 +597,11 @@ async def entrypoint(ctx: JobContext):
             azure.STT(),
         ]
     )
-    # LLM: Gemini 3.1 Flash Lite as primary, falling back to gpt-5-mini then
-    # gpt-4o (both OpenAI, existing key) if Gemini errors out mid-call.
-    llm = agents_llm.FallbackAdapter(
-        [
-            google.LLM(model="gemini-3.1-flash-lite", temperature=0.1),
-            openai.LLM(model="gpt-5-mini", temperature=0.1),
-            openai.LLM(model="gpt-4o", temperature=0.1),
-        ]
-    )
-    vad = silero.VAD.load()
+    llm = openai.LLM(model="gpt-4o", temperature=0.1)
+    # Loaded once per worker process in prewarm(), not per call — silero
+    # model load is one of the bigger contributors to pre-greeting delay
+    # when done fresh on every call.
+    vad = ctx.proc.userdata["vad"]
 
     # TTS: ElevenLabs as primary, Azure's Ezinne (Nigerian) voice as fallback
     # if ElevenLabs errors out mid-call.
@@ -785,6 +777,14 @@ async def entrypoint(ctx: JobContext):
         await asyncio.sleep(1)
 
 
+def prewarm(proc):
+    """Runs once per worker process (not per call). Loading the Silero VAD
+    model here instead of inside entrypoint() means every call reuses the
+    already-loaded model instead of paying its load cost before the greeting
+    can play."""
+    proc.userdata["vad"] = silero.VAD.load()
+
+
 if __name__ == "__main__":
     # Requires ELEVENLABS_API_KEY in .env.local (auto-mapped to ELEVEN_API_KEY)
     #
@@ -793,4 +793,6 @@ if __name__ == "__main__":
     # dispatch. Without a matching agent_name here, this worker only
     # registers for automatic dispatch and never receives jobs from that
     # rule — the dispatch name below must match the dispatch rule exactly.
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="fola"))
+    cli.run_app(
+        WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, agent_name="fola")
+    )
