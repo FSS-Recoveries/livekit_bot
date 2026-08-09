@@ -642,26 +642,16 @@ async def entrypoint(ctx: JobContext):
 
     session.on("conversation_item_added", _on_conversation_item_added)
 
-    # Resolve the customer lookup kicked off right after connecting — it's
-    # been running concurrently with provider setup above, so it's likely
-    # already done. Inject the result into the instructions so the model
-    # doesn't need to call get_customer_info itself for this call.
-    customer_data = None
-    if lookup_task:
-        try:
-            customer_data = await asyncio.wait_for(lookup_task, timeout=3)
-        except (asyncio.TimeoutError, requests.RequestException) as e:
-            print(f"Customer lookup failed or timed out: {e}")
-
-    if customer_data:
-        active_lead = customer_data.get("active_lead") or {}
-        system_prompt += (
-            f"\n\nThe customer has already been identified as "
-            f"{active_lead.get('first_name', '')} {active_lead.get('surname', '')} "
-            f"(phone: {phone_number}). Full customer data: {customer_data}. "
-            f"You do not need to call get_customer_info again unless the details seem wrong."
-        )
-    elif phone_number:
+    # Build the initial instructions synchronously — no blocking wait on the
+    # customer lookup here. This previously did `await asyncio.wait_for(
+    # lookup_task, timeout=3)` before creating the Agent, which added a fixed
+    # delay of up to 3s before session.start()/AMD/the greeting on every
+    # single call, regardless of where the greeting itself sits in the flow.
+    # The lookup hits an external Render-hosted API, which can be slow to
+    # wake from a cold start — so that 3s timeout was often fully consumed.
+    # The "not yet retrieved" fallback below is always a safe starting
+    # point, since the agent can fetch the data itself via get_customer_info.
+    if phone_number:
         system_prompt += (
             f"\n\nThe customer's phone number is {phone_number} but their account "
             f"could not be retrieved automatically. Call get_customer_info with "
@@ -678,6 +668,33 @@ async def entrypoint(ctx: JobContext):
         instructions=system_prompt,
         tools=[get_customer_info, end_call],
     )
+
+    async def _apply_customer_lookup_result() -> None:
+        """Runs in the background — doesn't block session start, AMD, or the
+        greeting. If the lookup that was kicked off right after connecting
+        resolves in time, swaps in the enriched instructions so the model
+        doesn't need to call get_customer_info itself; if it doesn't, the
+        fallback instructions set above already have the model do that
+        itself once the caller starts talking, so nothing breaks either way.
+        """
+        try:
+            customer_data = await asyncio.wait_for(lookup_task, timeout=3)
+        except (asyncio.TimeoutError, requests.RequestException) as e:
+            print(f"Customer lookup failed or timed out: {e}")
+            return
+        if not customer_data:
+            return
+        active_lead = customer_data.get("active_lead") or {}
+        enriched_prompt = system_prompt + (
+            f"\n\nThe customer has already been identified as "
+            f"{active_lead.get('first_name', '')} {active_lead.get('surname', '')} "
+            f"(phone: {phone_number}). Full customer data: {customer_data}. "
+            f"You do not need to call get_customer_info again unless the details seem wrong."
+        )
+        await agent.update_instructions(enriched_prompt)
+
+    if lookup_task:
+        asyncio.create_task(_apply_customer_lookup_result())
 
     # Start
     # BVCTelephony is tuned for the narrow, compressed audio band of real
