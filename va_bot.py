@@ -6,7 +6,6 @@ import requests
 import inspect
 import time
 import uuid
-import wave
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -30,7 +29,7 @@ from livekit.agents import (
 )
 from livekit.agents.inference import TurnDetector
 from livekit.agents.metrics import ModelUsageCollector
-from livekit.plugins import deepgram, openai, silero, elevenlabs, noise_cancellation, azure
+from livekit.plugins import deepgram, silero, elevenlabs, noise_cancellation, azure, google
 from livekit.agents.voice.amd import AMD, AMDCategory
 
 import firebase_admin
@@ -467,55 +466,6 @@ def _get_caller_phone_number(participant: "rtc.RemoteParticipant | None") -> str
     return participant.attributes.get("sip.phoneNumber")
 
 
-# ── Pre-recorded greeting (bypasses TTS) ─────────────────────────────────
-GREETING_WAV_PATH = os.path.join(os.getcwd(), "Greeting.wav")
-
-
-async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
-    """Publishes a pre-recorded WAV directly to the room as a raw audio
-    track, bypassing TTS entirely. Avoids TTS cold-start latency (and any
-    single provider's outage) for this one fixed opening line. The agent
-    stays silent until the caller actually replies, since nothing here
-    touches the LLM/STT turn-taking pipeline."""
-    if not os.path.exists(wav_path):
-        print(f"Greeting WAV not found at {wav_path}; skipping.")
-        return
-
-    with wave.open(wav_path, "rb") as wf:
-        sample_rate = wf.getframerate()
-        num_channels = wf.getnchannels()
-        sample_width = wf.getsampwidth()
-        if sample_width != 2:
-            print(f"Greeting WAV must be 16-bit PCM, got {sample_width * 8}-bit; skipping.")
-            return
-
-        source = rtc.AudioSource(sample_rate, num_channels)
-        track = rtc.LocalAudioTrack.create_audio_track("greeting", source)
-        publication = await room.local_participant.publish_track(track)
-
-        frame_ms = 20
-        frame_samples = int(sample_rate * frame_ms / 1000)
-        bytes_per_frame = frame_samples * num_channels * sample_width
-
-        try:
-            while True:
-                chunk = wf.readframes(frame_samples)
-                if not chunk:
-                    break
-                if len(chunk) < bytes_per_frame:
-                    chunk += b"\x00" * (bytes_per_frame - len(chunk))
-                audio_frame = rtc.AudioFrame(
-                    data=chunk,
-                    sample_rate=sample_rate,
-                    num_channels=num_channels,
-                    samples_per_channel=len(chunk) // (2 * num_channels),
-                )
-                await source.capture_frame(audio_frame)
-        finally:
-            await asyncio.sleep(0.5)
-            await room.local_participant.unpublish_track(publication.sid)
-
-
 # ── Entrypoint ──────────────────────────────────────────────────────────
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
@@ -587,7 +537,7 @@ async def entrypoint(ctx: JobContext):
         with open(prompt_path, "r", encoding="utf-8") as f:
             system_prompt = f.read().strip()
     except FileNotFoundError:
-        system_prompt = "You are Frances, a debt collection assistant."
+        system_prompt = "You are Kolawole, a debt collection assistant."
 
     # Providers
     # STT: Deepgram as primary, Azure as fallback if Deepgram errors out mid-call.
@@ -597,7 +547,9 @@ async def entrypoint(ctx: JobContext):
             azure.STT(),
         ]
     )
-    llm = openai.LLM(model="gpt-4o", temperature=0.1)
+    # Requires GOOGLE_API_KEY in the environment (Google AI Studio key), or
+    # pass api_key= directly here.
+    llm = google.LLM(model="gemini-2.5-flash-lite", temperature=0.1)
     # Loaded once per worker process in prewarm(), not per call — silero
     # model load is one of the bigger contributors to pre-greeting delay
     # when done fresh on every call.
@@ -698,22 +650,25 @@ async def entrypoint(ctx: JobContext):
     )
     await background_audio.start(room=ctx.room, agent_session=session)
 
-    # Answering Machine Detection: classify the start of the call before
-    # committing to the live opening line, so we don't talk over a voicemail
-    # greeting or waste it on an unreachable mailbox. Reuses our own LLM/STT
-    # so classification stays on our existing OpenAI/Deepgram keys rather
-    # than LiveKit's separate inference gateway.
-    #
-    # Skipped for `console` mode: there's no answering-machine scenario when
-    # testing with your own mic, and AMD has no real SIP participant to
-    # classify there anyway. `wait_until_finished=False` caps detection at
-    # the 20s timeout even if the caller talks continuously without a clean
-    # pause — otherwise AMD extends indefinitely waiting for silence and the
-    # greeting never fires.
-    if ctx.room.name == "console" or ctx.room.name.startswith("console-"):
+    # No greeting: the agent stays completely silent on connect. AMD still
+    # runs to classify the call (voicemail / mailbox unavailable / IVR /
+    # human) — if you want the agent to speak once it's confirmed human,
+    # add a session.say(...) or session.generate_reply() call where noted
+    # below.
+    if is_console:
+        # Console mode has no SIP participant, and no answering-machine
+        # scenario when testing with your own mic — keep the simple TTS
+        # line, no AMD.
         result = None
         call_state["amd_category"] = "skipped_console"
+        await session.say(
+            "Hello, how can I assist you with your account today?",
+            allow_interruptions=True,
+        )
     else:
+        # `wait_until_finished=False` caps detection at the 20s timeout even
+        # if the caller talks continuously without a clean pause —
+        # otherwise AMD extends indefinitely waiting for silence.
         async with AMD(
             session,
             llm=llm,
@@ -724,31 +679,17 @@ async def entrypoint(ctx: JobContext):
             result = await detector.execute()
         call_state["amd_category"] = result.category.value
 
-    if result is not None and result.category == AMDCategory.MACHINE_VM:
-        ctx.shutdown(reason="voicemail detected")
-        return
-    elif result is not None and result.category == AMDCategory.MACHINE_UNAVAILABLE:
-        ctx.shutdown(reason="mailbox unavailable")
-        return
-    elif result is not None and result.category == AMDCategory.MACHINE_IVR:
-        # AMD's built-in IVR navigation already kicked off inside execute();
-        # nothing further to do here.
-        pass
-    elif is_console:
-        # Console mode has no SIP participant/greeting WAV workflow — keep
-        # the simple TTS line for local mic testing.
-        await session.say(
-            "Hello, how can I assist you with your account today?",
-            allow_interruptions=True,
-        )
-    else:
-        # Human or uncertain: play the pre-recorded greeting instead of TTS
-        # (avoids TTS cold-start latency and any single provider's outage
-        # for this one fixed line). Nothing is said after this — the LLM
-        # only fires once STT/VAD detects the caller's reply, so the agent
-        # naturally stays silent until they actually respond, then follows
-        # the prompt's own Opening Flow script via normal TTS.
-        await _play_wav_greeting(ctx.room, GREETING_WAV_PATH)
+        if result.category == AMDCategory.MACHINE_VM:
+            ctx.shutdown(reason="voicemail detected")
+            return
+        elif result.category == AMDCategory.MACHINE_UNAVAILABLE:
+            ctx.shutdown(reason="mailbox unavailable")
+            return
+        elif result.category == AMDCategory.MACHINE_IVR:
+            # AMD's built-in IVR navigation already kicked off inside
+            # execute(); nothing further to do here.
+            pass
+        # human/uncertain: greeting was already played above.
 
     # Silence safety net: the LLM only reacts to turns, so if the customer
     # goes quiet it can't act on its own. After user_away_timeout (15s
