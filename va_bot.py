@@ -587,7 +587,7 @@ async def entrypoint(ctx: JobContext):
         with open(prompt_path, "r", encoding="utf-8") as f:
             system_prompt = f.read().strip()
     except FileNotFoundError:
-        system_prompt = "You are Kolawole, a debt collection assistant."
+        system_prompt = "You are Frances, a debt collection assistant."
 
     # Providers
     # STT: Deepgram as primary, Azure as fallback if Deepgram errors out mid-call.
