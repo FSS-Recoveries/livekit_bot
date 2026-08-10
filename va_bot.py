@@ -706,7 +706,7 @@ async def entrypoint(ctx: JobContext):
         [
             inference.TTS(
                 model="fishaudio/s2-pro",
-                voice="v_ebJJAf8QhLMs",
+                voice="v_ebJJAf8QhLMs",#"v_tkbNkcSD62zN",#"",
                 extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "low"},
             ),
             #build_azure_tts(),
@@ -822,7 +822,7 @@ async def entrypoint(ctx: JobContext):
     # here since this only plays into the outbound track, but worth knowing
     # if it starts sounding intrusive).
     background_audio = BackgroundAudioPlayer(
-        ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.6),
+        ambient_sound=AudioConfig(BuiltinAudioClip.CROWDED_ROOM, volume=0.8),
     )
     await background_audio.start(room=ctx.room, agent_session=session)
 
