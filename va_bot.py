@@ -3,6 +3,7 @@ import asyncio
 import os
 import re
 import requests
+import inspect
 import time
 import uuid
 import wave
@@ -31,7 +32,7 @@ from livekit.agents import (
 )
 from livekit.agents.inference import TurnDetector
 from livekit.agents.metrics import ModelUsageCollector
-from livekit.plugins import silero, noise_cancellation
+from livekit.plugins import silero, noise_cancellation, elevenlabs
 from livekit.agents.voice.amd import AMD, AMDCategory
 
 import firebase_admin
@@ -39,11 +40,46 @@ from firebase_admin import credentials as fb_credentials
 from firebase_admin import firestore as fb_firestore
 from firebase_admin import storage as fb_storage
 
+# ── Quick compat shim: Mp3StreamDecoder → AudioStreamDecoder ─────────────
+# Some livekit-agents versions removed Mp3StreamDecoder in favor of AudioStreamDecoder.
+# If the direct ElevenLabs plugin (used for TTS, to preserve our custom
+# voice — see build_elevenlabs_tts below) tries to use Mp3StreamDecoder,
+# provide a lightweight alias.
+try:
+    from livekit.agents import utils as _lk_utils  # type: ignore
+    _codecs = _lk_utils.codecs
+    if not hasattr(_codecs, "Mp3StreamDecoder") and hasattr(_codecs, "AudioStreamDecoder"):
+        import inspect as _inspect
+
+        class _Mp3Shim(_codecs.AudioStreamDecoder):  # type: ignore[attr-defined]
+            def __init__(self, *args, **kwargs):
+                # Newer AudioStreamDecoder may accept a 'format' kwarg; prefer mp3 if available.
+                params = set()
+                try:
+                    params = set(_inspect.signature(_codecs.AudioStreamDecoder).parameters.keys())  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                if "format" in params:
+                    kwargs.setdefault("format", "mp3")
+                super().__init__(*args, **kwargs)
+
+        _codecs.Mp3StreamDecoder = _Mp3Shim  # alias so older plugins keep working
+except Exception:
+    # Non-fatal; if this fails we still might succeed via PCM encoding below.
+    pass
+
 # ── Load env ────────────────────────────────────────────────────────────
 # .env.local should contain LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET.
-# No provider keys (ELEVENLABS_API_KEY, OPENAI_API_KEY, etc.) are needed
-# anymore — STT/LLM/TTS all run through LiveKit Inference now.
+# STT and LLM run through LiveKit Inference (no separate keys needed there).
+# TTS is the one exception: to keep our custom cloned ElevenLabs voice
+# (LiveKit Inference only supports ElevenLabs' own default voices, not
+# custom/cloned ones — see build_elevenlabs_tts below), TTS uses the direct
+# ElevenLabs plugin, which needs ELEVENLABS_API_KEY set here.
 load_dotenv(".env.local")
+
+# Map ELEVENLABS_API_KEY -> ELEVEN_API_KEY for plugin compatibility
+if not os.getenv("ELEVEN_API_KEY") and os.getenv("ELEVENLABS_API_KEY"):
+    os.environ["ELEVEN_API_KEY"] = os.getenv("ELEVENLABS_API_KEY")
 
 # ── Firebase (call recordings + call records) ────────────────────────────
 FIREBASE_SERVICE_ACCOUNT_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "service_account.json")
@@ -326,6 +362,117 @@ async def end_call(ctx: RunContext) -> None:
     get_job_context().shutdown(reason="call ended by agent")
 
 
+# ── Version-safe ElevenLabs TTS builder ─────────────────────────────────
+def build_elevenlabs_tts():
+    """
+    Builds an ElevenLabs TTS instance that works across multiple versions of
+    livekit-plugins-elevenlabs by:
+      - Creating VoiceSettings with only supported kwargs
+      - Creating Voice with only supported kwargs
+      - Passing either `voice` or `voice_id` to TTS depending on signature
+      - Prefer PCM encoding when available to bypass MP3 decoding
+      - Filtering optional params (language, streaming_latency, enable_ssml_parsing, encoding)
+    Uses ELEVEN_API_KEY from the environment (mapped from ELEVENLABS_API_KEY above).
+
+    Uses the direct ElevenLabs plugin rather than LiveKit Inference
+    specifically because our voice_id below is a custom cloned voice on our
+    own ElevenLabs account — LiveKit Inference only supports ElevenLabs'
+    own default voices, not custom/cloned ones.
+    """
+    model     = os.getenv("ELEVENLABS_TTS_MODEL", "eleven_flash_v2_5")
+    voice_id  = "me1JPr2K6H7KZB9nz2Wk"#os.getenv("ELEVENLABS_VOICE_ID", "RAVWJW17BPoSIf05iXxf")  # example default
+    v_name    = os.getenv("ELEVENLABS_VOICE_NAME", "custom")
+    v_cat     = os.getenv("ELEVENLABS_VOICE_CATEGORY", "premade")
+
+    desired_vs = {
+        "stability": 0.9,
+        "similarity_boost": 0.9,
+        "style": 0.9,
+        "use_speaker_boost": False,#True,
+        "speed": .4,  # dropped automatically if unsupported
+    }
+
+    def _filter_kwargs(cls, kwargs):
+        try:
+            params = set(inspect.signature(cls).parameters.keys())
+            return {k: v for k, v in kwargs.items() if k in params}
+        except (ValueError, TypeError):
+            return {}
+
+    # VoiceSettings
+    voice_settings = None
+    try:
+        vs_kwargs = _filter_kwargs(elevenlabs.VoiceSettings, desired_vs)
+        if vs_kwargs:
+            try:
+                voice_settings = elevenlabs.VoiceSettings(**vs_kwargs)
+            except TypeError:
+                for k in list(vs_kwargs.keys()):
+                    test = dict(vs_kwargs)
+                    test.pop(k, None)
+                    try:
+                        voice_settings = elevenlabs.VoiceSettings(**test)
+                        break
+                    except TypeError:
+                        continue
+    except AttributeError:
+        voice_settings = None
+
+    # Voice
+    voice = None
+    try:
+        voice_kwargs = _filter_kwargs(
+            elevenlabs.Voice,
+            {"id": voice_id, "name": v_name, "category": v_cat, "settings": voice_settings},
+        )
+        if "settings" in voice_kwargs and voice_kwargs["settings"] is None:
+            voice_kwargs.pop("settings", None)
+        voice = elevenlabs.Voice(**voice_kwargs)
+    except AttributeError:
+        voice = None  # fall back to voice_id on TTS
+
+    # TTS kwargs
+    try:
+        tts_params = set(inspect.signature(elevenlabs.TTS).parameters.keys())
+    except (ValueError, TypeError):
+        tts_params = set()
+
+    tts_kwargs = {"model": model}
+
+    if "voice" in tts_params and voice is not None:
+        tts_kwargs["voice"] = voice
+    elif "voice_id" in tts_params:
+        tts_kwargs["voice_id"] = voice_id
+
+    # Prefer PCM encoding if exposed (avoids MP3 decoder path).
+    # The plugin exposes an 'encoding' parameter with a TTSEncoding enum in newer builds.
+    try:
+        Enc = getattr(elevenlabs, "TTSEncoding", None)
+        chosen_enc = None
+        if Enc is not None:
+            # Try common PCM enum names across releases
+            for attr in ("pcm", "pcm_16000", "s16le_16000", "linear16", "pcm16_16000"):
+                if hasattr(Enc, attr):
+                    chosen_enc = getattr(Enc, attr)
+                    break
+        if "encoding" in tts_params and chosen_enc is not None:
+            tts_kwargs["encoding"] = chosen_enc
+    except Exception:
+        pass
+
+    # Optional args
+    for opt_key, opt_val in {
+        "language": "en",
+        "streaming_latency": 3,
+        "enable_ssml_parsing": True,
+        # some versions also support inactivity_timeout, chunk_length_schedule, etc.
+    }.items():
+        if opt_key in tts_params:
+            tts_kwargs[opt_key] = opt_val
+
+    return elevenlabs.TTS(**tts_kwargs)
+
+
 # ── SIP participant + caller phone number ────────────────────────────────
 async def _wait_for_sip_participant(
     room: rtc.Room, timeout: float = 10.0
@@ -486,11 +633,13 @@ async def entrypoint(ctx: JobContext):
     except FileNotFoundError:
         system_prompt = "You are Kolawole, a debt collection assistant."
 
-    # Providers — all via LiveKit Inference (livekit.agents.inference), so
-    # this is billed entirely through your LiveKit Cloud account: no
-    # OPENAI_API_KEY, DEEPGRAM_API_KEY, ELEVENLABS_API_KEY, GOOGLE_API_KEY,
-    # or AZURE_SPEECH_KEY needed anymore. Only LIVEKIT_URL/API_KEY/API_SECRET
-    # (which you already need to run the worker at all) are required.
+    # Providers — STT and LLM via LiveKit Inference (livekit.agents.inference),
+    # billed through your LiveKit Cloud account: no DEEPGRAM_API_KEY,
+    # GOOGLE_API_KEY, OPENAI_API_KEY needed for those two.
+    #
+    # TTS is the one exception (see below): it uses the direct ElevenLabs
+    # plugin to preserve our custom cloned voice, so ELEVENLABS_API_KEY is
+    # still required for that one component.
     #
     # STT: ElevenLabs Scribe v2 Realtime as primary, Deepgram as fallback if
     # ElevenLabs errors out mid-call.
@@ -523,27 +672,23 @@ async def entrypoint(ctx: JobContext):
     # process in prewarm(), not per call).
     vad = ctx.proc.userdata["vad"]
 
-    # TTS: ElevenLabs as primary.
+    # TTS: direct ElevenLabs plugin as primary — NOT LiveKit Inference —
+    # specifically because build_elevenlabs_tts() uses a custom cloned voice
+    # on our own ElevenLabs account, and LiveKit Inference only supports
+    # ElevenLabs' own default voices, not custom/cloned ones. This is the
+    # one component billed outside LiveKit (needs ELEVENLABS_API_KEY).
     #
-    # The Azure "Ezinne" Nigerian-accented voice that was the fallback here
-    # is NOT available through LiveKit Inference (Azure isn't one of its
-    # providers) — there's no like-for-like substitute confirmed, so this
-    # now falls back to a second Inference-based TTS provider (Cartesia)
-    # instead. It won't sound like Ezinne. If matching that specific accent
-    # matters more than single-provider billing, keep azure.TTS(voice=
-    # "en-NG-EzinneNeural") as the fallback (via livekit-plugins-azure) and
-    # accept AZURE_SPEECH_KEY as the one remaining non-LiveKit credential.
-    #
-    # Also unconfirmed: whether the fine-grained voice_settings this used to
-    # send directly to ElevenLabs (stability/similarity_boost/style/speed)
-    # carry over through the Inference string form below — worth testing.
-    # If they don't, check inference.TTS's extra_kwargs for how to pass them.
+    # Fallback stays on LiveKit Inference (Cartesia) rather than Azure: no
+    # extra key needed for the fallback path, even though the primary now
+    # requires one. If ElevenLabs errors out mid-call, this won't sound like
+    # our custom voice, but the call keeps going.
     tts = agents_tts.FallbackAdapter(
         [
-            inference.TTS("elevenlabs/eleven_flash_v2_5:me1JPr2K6H7KZB9nz2Wk"),
+            build_elevenlabs_tts(),
             inference.TTS("cartesia/sonic-3"),
         ]
     )
+
 
 
     # Usage metrics (LLM tokens, TTS characters, STT audio seconds), broken
@@ -735,10 +880,13 @@ def prewarm(proc):
 
 
 if __name__ == "__main__":
-    # No provider API keys needed — stt/llm/tts run through LiveKit
-    # Inference, billed via your LiveKit Cloud account. .env.local only
-    # needs LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET (+ Firebase creds
-    # for call recording, which is unrelated to voice AI billing).
+    # STT and LLM run through LiveKit Inference, billed via your LiveKit
+    # Cloud account — no DEEPGRAM_API_KEY/GOOGLE_API_KEY/OPENAI_API_KEY
+    # needed for those. TTS still needs ELEVENLABS_API_KEY (direct plugin,
+    # to preserve our custom cloned voice — Inference only supports
+    # ElevenLabs' default voices). .env.local needs LIVEKIT_URL/
+    # LIVEKIT_API_KEY/LIVEKIT_API_SECRET + ELEVENLABS_API_KEY (+ Firebase
+    # creds for call recording, unrelated to voice AI billing).
     #
     # agent_name="fola" is required because the SIP dispatch rule
     # (roomConfig.agents: [{"agentName": "fola"}]) uses explicit/named
