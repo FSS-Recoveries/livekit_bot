@@ -40,7 +40,7 @@ from firebase_admin import credentials as fb_credentials
 from firebase_admin import firestore as fb_firestore
 from firebase_admin import storage as fb_storage
 
-from livekit.plugins import deepgram, openai, silero, elevenlabs, noise_cancellation, azure, fishaudio
+from livekit.plugins import deepgram, openai, silero, elevenlabs, noise_cancellation, azure
 from livekit.agents import inference
 
 # ── Quick compat shim: Mp3StreamDecoder → AudioStreamDecoder ─────────────
