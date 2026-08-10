@@ -707,7 +707,7 @@ async def entrypoint(ctx: JobContext):
             inference.TTS(
                 model="fishaudio/s2.1-pro",
                 voice="v_j9rNPYCMSknp",
-                extra_kwargs={"speed": 1.15, "temperature": 0, "latency": "low"},
+                extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "low"},
             ),
             #build_azure_tts(),
             #build_elevenlabs_tts(),
