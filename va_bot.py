@@ -577,6 +577,7 @@ async def entrypoint(ctx: JobContext):
     call_state = {"amd_category": None}
     transcript_lines: list[str] = []
     egress_task = asyncio.create_task(_start_call_recording(ctx))
+    max_duration_task: asyncio.Task | None = None
 
     async def _on_shutdown():
         # ctx.shutdown() (used everywhere we decide to end the call) only
@@ -590,6 +591,12 @@ async def entrypoint(ctx: JobContext):
             await ctx.delete_room()
         except Exception as e:
             print(f"Failed to delete room / hang up call: {e}")
+
+        # Stop the max-duration timer if the call ended for some other
+        # reason first (end_call, AMD, silence timeout, caller hangup) —
+        # otherwise it's still sleeping and would fire pointlessly later.
+        if max_duration_task is not None:
+            max_duration_task.cancel()
 
         egress_info = await egress_task
         recording_url = await _finish_call_recording(ctx, egress_info)
@@ -788,11 +795,43 @@ async def entrypoint(ctx: JobContext):
     )
 
     # Background ambient office noise so Fola sounds like a real call-center
-    # agent rather than speaking from a silent void.
+    # agent rather than speaking from a silent void. Was volume=0.3 — likely
+    # too quiet to notice under phone-codec compression; LiveKit's own docs
+    # examples all use 0.8. Bumped to 0.6 as a middle ground; tune from here
+    # (too high will compete with the voice track and hurt STT/turn
+    # detection on the caller's side, since it's picked up by the mic too
+    # if the ambience were ever played on an open speaker — not a concern
+    # here since this only plays into the outbound track, but worth knowing
+    # if it starts sounding intrusive).
     background_audio = BackgroundAudioPlayer(
-        ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.3),
+        ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.6),
     )
     await background_audio.start(room=ctx.room, agent_session=session)
+
+    # Max call duration: hard cap at 6 minutes from call start (not from
+    # here — it accounts for time already spent on SIP wait/AMD/greeting
+    # above, using the same call_started_at as the recording/transcript).
+    # Speaks a short closing line first rather than cutting off silently
+    # mid-sentence; allow_interruptions=False so the caller talking over it
+    # doesn't extend the call past the cap.
+    MAX_CALL_DURATION_SECONDS = 6 * 60
+
+    async def _enforce_max_call_duration() -> None:
+        remaining = MAX_CALL_DURATION_SECONDS - (time.time() - call_started_at)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        if ctx.room.connection_state != rtc.ConnectionState.CONN_CONNECTED:
+            return  # call already ended for some other reason
+        try:
+            await session.say(
+                "We're at the time limit for this call, so I have to go now. Thank you.",
+                allow_interruptions=False,
+            )
+        except Exception as e:
+            print(f"Failed to speak max-call-duration closing line: {e}")
+        ctx.shutdown(reason="max call duration (6 min) reached")
+
+    max_duration_task = asyncio.create_task(_enforce_max_call_duration())
 
     # Greeting first, then Answering Machine Detection. Previously AMD ran
     # before anything was said (to avoid talking over a voicemail greeting);
