@@ -695,7 +695,7 @@ async def entrypoint(ctx: JobContext):
                 model="s2.1-pro",
                 voice_id="v_tkbNkcSD62zN",
             ),
-            build_elevenlabs_tts(),
+            #build_elevenlabs_tts(),
         ]
     )
 
