@@ -704,7 +704,11 @@ async def entrypoint(ctx: JobContext):
     # if Fish Audio errors out mid-call, TTS has nothing to fall back to.
     tts = agents_tts.FallbackAdapter(
         [
-            inference.TTS(model="fishaudio/s2.1-pro", voice="v_tkbNkcSD62zN"),
+            inference.TTS(
+                model="fishaudio/s2.1-pro",
+                voice="v_tkbNkcSD62zN",
+                extra_kwargs={"speed": 1.3},
+            ),
             #build_azure_tts(),
             #build_elevenlabs_tts(),
         ]
