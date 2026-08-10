@@ -74,10 +74,11 @@ except Exception:
 # ── Load env ────────────────────────────────────────────────────────────
 # .env.local should contain LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET.
 # STT and LLM run through LiveKit Inference (no separate keys needed there).
-# TTS is the one exception: to keep our custom cloned ElevenLabs voice
-# (LiveKit Inference only supports ElevenLabs' own default voices, not
-# custom/cloned ones — see build_elevenlabs_tts below), TTS uses the direct
-# ElevenLabs plugin, which needs ELEVENLABS_API_KEY set here.
+# TTS is the exception: it uses the direct Azure plugin as primary (needs
+# AZURE_SPEECH_KEY/AZURE_SPEECH_REGION) and the direct ElevenLabs plugin as
+# fallback, to keep our custom cloned ElevenLabs voice (LiveKit Inference
+# only supports ElevenLabs' own default voices, not custom/cloned ones — see
+# build_elevenlabs_tts below), which needs ELEVENLABS_API_KEY set here.
 load_dotenv(".env.local")
 
 # Map ELEVENLABS_API_KEY -> ELEVEN_API_KEY for plugin compatibility
@@ -203,9 +204,10 @@ async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
 # pricing page as of 2026-08-09. These are ESTIMATES for internal cost
 # tracking only — always reconcile against actual provider invoices, since
 # rates change and this doesn't account for volume/commitment discounts.
-# Azure isn't priced here: its plugins don't report model_provider/model_name
-# metadata the way the others do, and it's fallback-only so hasn't shown up
-# in a real usage entry yet to confirm the exact keys it would use.
+# Azure isn't priced here: its plugin doesn't report model_provider/model_name
+# metadata the way the others do, so it hasn't been confirmed against a real
+# usage entry to know the exact keys it would use (even though it's now the
+# primary TTS voice — see build_azure_tts).
 #
 # Gemini 3.1 Flash-Lite is matched on `model` alone (no `provider` check,
 # unlike the OpenAI/ElevenLabs/Deepgram entries below) — the exact
@@ -253,7 +255,7 @@ def _estimate_entry_cost(entry: dict) -> float | None:
 def _add_estimated_costs(usage: list) -> tuple[list, float]:
     """Annotates each usage entry with an estimated_cost_usd and returns the
     enriched list alongside the total. Entries with no known pricing (e.g.
-    Azure fallback, LiveKit's own interruption/turn-detector usage) are left
+    Azure TTS, LiveKit's own interruption/turn-detector usage) are left
     with estimated_cost_usd=None rather than guessed."""
     total = 0.0
     enriched = []
@@ -476,6 +478,17 @@ def build_elevenlabs_tts():
     return elevenlabs.TTS(**tts_kwargs)
 
 
+# ── Azure TTS builder ────────────────────────────────────────────────────
+def build_azure_tts():
+    """
+    Builds the primary Azure neural TTS voice (en-NG-EzinneNeural by default).
+    AZURE_SPEECH_KEY and AZURE_SPEECH_REGION are picked up automatically from
+    the environment by azure.TTS itself when not passed explicitly.
+    """
+    voice = os.getenv("AZURE_TTS_VOICE", "en-NG-EzinneNeural")
+    return azure.TTS(voice=voice)
+
+
 # ── SIP participant + caller phone number ────────────────────────────────
 async def _wait_for_sip_participant(
     room: rtc.Room, timeout: float = 10.0
@@ -647,9 +660,9 @@ async def entrypoint(ctx: JobContext):
     # billed through your LiveKit Cloud account: no DEEPGRAM_API_KEY,
     # GOOGLE_API_KEY, OPENAI_API_KEY needed for those two.
     #
-    # TTS is the one exception (see below): it uses the direct ElevenLabs
-    # plugin to preserve our custom cloned voice, so ELEVENLABS_API_KEY is
-    # still required for that one component.
+    # TTS is the exception (see below): it uses direct Azure and ElevenLabs
+    # plugins instead of Inference, so AZURE_SPEECH_KEY, AZURE_SPEECH_REGION,
+    # and ELEVENLABS_API_KEY are still required for that component.
     #
     # STT: ElevenLabs Scribe v2 Realtime as primary, Deepgram as fallback if
     # ElevenLabs errors out mid-call.
@@ -682,19 +695,18 @@ async def entrypoint(ctx: JobContext):
     # process in prewarm(), not per call).
     vad = ctx.proc.userdata["vad"]
 
-    # TTS: direct ElevenLabs plugin as primary — NOT LiveKit Inference —
-    # specifically because build_elevenlabs_tts() uses a custom cloned voice
-    # on our own ElevenLabs account, and LiveKit Inference only supports
-    # ElevenLabs' own default voices, not custom/cloned ones. This is the
-    # one component billed outside LiveKit (needs ELEVENLABS_API_KEY).
+    # TTS: Azure neural voice (en-NG-EzinneNeural) as primary, direct
+    # ElevenLabs plugin as fallback if Azure errors out mid-call.
     #
-    # TTS: Fish Audio S2.1 Pro as primary, ElevenLabs as fallback
-    # if Fish errors out mid-call.
-
-
+    # Both go through direct plugins rather than LiveKit Inference: Azure
+    # isn't available via Inference at all, and build_elevenlabs_tts() uses a
+    # custom cloned voice on our own ElevenLabs account — Inference only
+    # supports ElevenLabs' own default voices, not custom/cloned ones. This
+    # makes TTS billed outside LiveKit entirely (needs AZURE_SPEECH_KEY +
+    # AZURE_SPEECH_REGION, and ELEVENLABS_API_KEY).
     tts = agents_tts.FallbackAdapter(
         [
-            inference.TTS(model="fish-audio/s2.1-pro", voice="v_tkbNkcSD62zN"),
+            build_azure_tts(),
             build_elevenlabs_tts(),
         ]
     )
@@ -924,11 +936,13 @@ def prewarm(proc):
 if __name__ == "__main__":
     # STT and LLM run through LiveKit Inference, billed via your LiveKit
     # Cloud account — no DEEPGRAM_API_KEY/GOOGLE_API_KEY/OPENAI_API_KEY
-    # needed for those. TTS still needs ELEVENLABS_API_KEY (direct plugin,
-    # to preserve our custom cloned voice — Inference only supports
+    # needed for those. TTS still needs AZURE_SPEECH_KEY/AZURE_SPEECH_REGION
+    # (direct plugin, primary voice) and ELEVENLABS_API_KEY (direct plugin,
+    # fallback, to preserve our custom cloned voice — Inference only supports
     # ElevenLabs' default voices). .env.local needs LIVEKIT_URL/
-    # LIVEKIT_API_KEY/LIVEKIT_API_SECRET + ELEVENLABS_API_KEY (+ Firebase
-    # creds for call recording, unrelated to voice AI billing).
+    # LIVEKIT_API_KEY/LIVEKIT_API_SECRET + AZURE_SPEECH_KEY/
+    # AZURE_SPEECH_REGION + ELEVENLABS_API_KEY (+ Firebase creds for call
+    # recording, unrelated to voice AI billing).
     #
     # agent_name="fola" is required because the SIP dispatch rule
     # (roomConfig.agents: [{"agentName": "fola"}]) uses explicit/named
