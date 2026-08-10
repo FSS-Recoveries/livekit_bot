@@ -695,18 +695,16 @@ async def entrypoint(ctx: JobContext):
     # process in prewarm(), not per call).
     vad = ctx.proc.userdata["vad"]
 
-    # TTS: Azure neural voice (en-NG-EzinneNeural) as primary, direct
-    # ElevenLabs plugin as fallback if Azure errors out mid-call.
+    # TTS: Fish Audio S2.1 Pro (our own custom voice) as primary, via LiveKit
+    # Inference — no separate API key needed, billed through LiveKit Cloud.
     #
-    # Both go through direct plugins rather than LiveKit Inference: Azure
-    # isn't available via Inference at all, and build_elevenlabs_tts() uses a
-    # custom cloned voice on our own ElevenLabs account — Inference only
-    # supports ElevenLabs' own default voices, not custom/cloned ones. This
-    # makes TTS billed outside LiveKit entirely (needs AZURE_SPEECH_KEY +
-    # AZURE_SPEECH_REGION, and ELEVENLABS_API_KEY).
+    # build_azure_tts() and build_elevenlabs_tts() are kept defined below but
+    # commented out here — swap either back in as the 2nd list entry to
+    # restore it as a fallback. Note there's currently no active fallback:
+    # if Fish Audio errors out mid-call, TTS has nothing to fall back to.
     tts = agents_tts.FallbackAdapter(
         [
-            inference.TTS(model="fish-audio/s2.1-pro", voice="v_tkbNkcSD62zN"),
+            inference.TTS(model="fishaudio/s2.1-pro", voice="v_tkbNkcSD62zN"),
             #build_azure_tts(),
             #build_elevenlabs_tts(),
         ]
