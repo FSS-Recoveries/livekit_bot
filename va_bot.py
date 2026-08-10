@@ -706,7 +706,8 @@ async def entrypoint(ctx: JobContext):
     # AZURE_SPEECH_REGION, and ELEVENLABS_API_KEY).
     tts = agents_tts.FallbackAdapter(
         [
-            build_azure_tts(),
+            inference.TTS(model="fish-audio/s2.1-pro", voice="v_tkbNkcSD62zN"),
+            #build_azure_tts(),
             #build_elevenlabs_tts(),
         ]
     )
