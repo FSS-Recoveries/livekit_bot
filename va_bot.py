@@ -41,6 +41,7 @@ from firebase_admin import firestore as fb_firestore
 from firebase_admin import storage as fb_storage
 
 from livekit.plugins import deepgram, openai, silero, elevenlabs, noise_cancellation, azure, fishaudio
+from livekit.agents import inference
 
 # ── Quick compat shim: Mp3StreamDecoder → AudioStreamDecoder ─────────────
 # Some livekit-agents versions removed Mp3StreamDecoder in favor of AudioStreamDecoder.
@@ -689,13 +690,12 @@ async def entrypoint(ctx: JobContext):
     #
     # TTS: Fish Audio S2.1 Pro as primary, ElevenLabs as fallback
     # if Fish errors out mid-call.
+
+
     tts = agents_tts.FallbackAdapter(
         [
-            fishaudio.TTS(
-                model="s2.1-pro",
-                voice_id="v_tkbNkcSD62zN",
-            ),
-            #build_elevenlabs_tts(),
+            inference.TTS(model="fish-audio/s2.1-pro", voice="v_tkbNkcSD62zN"),
+            build_elevenlabs_tts(),
         ]
     )
 
