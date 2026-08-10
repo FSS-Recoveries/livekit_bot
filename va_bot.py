@@ -707,7 +707,7 @@ async def entrypoint(ctx: JobContext):
     tts = agents_tts.FallbackAdapter(
         [
             build_azure_tts(),
-            build_elevenlabs_tts(),
+            #build_elevenlabs_tts(),
         ]
     )
 
