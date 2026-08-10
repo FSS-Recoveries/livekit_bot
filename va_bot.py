@@ -612,8 +612,8 @@ async def entrypoint(ctx: JobContext):
     # STT: Deepgram as primary, Azure as fallback if Deepgram errors out mid-call.
     stt = agents_stt.FallbackAdapter(
         [
-            deepgram.STT(model="nova-3"),
             azure.STT(),
+            deepgram.STT(model="nova-3"),
         ]
     )
     # LLM: Gemini 3.1 Flash-Lite as primary, gpt-5-mini as fallback if
