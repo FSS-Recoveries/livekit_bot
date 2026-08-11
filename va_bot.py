@@ -758,7 +758,15 @@ async def entrypoint(ctx: JobContext):
             ),
             #build_azure_tts(),
             build_elevenlabs_tts(),
-        ]
+        ],
+        # 0: on any mid-stream failure, switch to the next TTS immediately
+        # instead of retrying the same provider first. Each retry re-opens
+        # a fresh stream for the same text; if the failed attempt had
+        # already pushed partial audio to the room before erroring, a retry
+        # starts that same sentence over from the beginning — overlapping
+        # with the tail of what's already playing. Skipping straight to a
+        # different provider on the first failure avoids that overlap.
+        max_retry_per_tts=0,
     )
 
 
