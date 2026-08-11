@@ -225,6 +225,12 @@ _GPT5_MINI_CACHED_INPUT_PER_TOKEN = 0.025 / 1_000_000
 _GPT5_MINI_OUTPUT_PER_TOKEN = 2.00 / 1_000_000
 _ELEVENLABS_FLASH_PER_CHARACTER = 0.05 / 1_000
 _DEEPGRAM_NOVA3_PER_SECOND = 0.0077 / 60
+# Sourced directly from livekit.com/pricing (the actual billing rate card for
+# this one, unlike the direct-provider prices above) as of 2026-08-11: $0.0090
+# per minute of generated audio, same rate on Build/Ship and Scale plans.
+# Matched on `model` alone, same reasoning as Gemini above — the `provider`
+# string this entry reports hasn't been confirmed against a real usage entry.
+_FISHAUDIO_S21PRO_PER_MINUTE = 0.0090
 
 
 def _estimate_entry_cost(entry: dict) -> float | None:
@@ -251,6 +257,8 @@ def _estimate_entry_cost(entry: dict) -> float | None:
         return entry.get("characters_count", 0) * _ELEVENLABS_FLASH_PER_CHARACTER
     if provider == "Deepgram" and model == "nova-3":
         return entry.get("audio_duration", 0) * _DEEPGRAM_NOVA3_PER_SECOND
+    if model == "fishaudio/s2.1-pro":
+        return entry.get("audio_duration", 0) / 60 * _FISHAUDIO_S21PRO_PER_MINUTE
     return None
 
 
