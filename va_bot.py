@@ -564,7 +564,7 @@ GREETING_WAV_PATH = os.path.join(os.getcwd(), "Greeting.wav")
 # OPENING_STALL_DELAY_SECONDS after GREETING_WAV_PATH finishes (customer
 # info / AMD still resolving).
 GREETING_V2_WAV_PATH = os.path.join(os.getcwd(), "Greeting v2.wav")
-OPENING_STALL_DELAY_SECONDS = 4
+OPENING_STALL_DELAY_SECONDS = 6
 # From the agent's first real turn onward, how long it can sit "thinking"
 # before speaking a short "Hmm" filler while the real reply keeps loading.
 HMM_FILLER_DELAY_SECONDS = 4
