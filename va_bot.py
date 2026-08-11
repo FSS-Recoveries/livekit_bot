@@ -720,7 +720,7 @@ async def entrypoint(ctx: JobContext):
                 extra_kwargs={"speed": 1.13, "temperature": 0, "latency": "normal"},
             ),
             #build_azure_tts(),
-            #build_elevenlabs_tts(),
+            build_elevenlabs_tts(),
         ]
     )
 
