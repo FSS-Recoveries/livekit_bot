@@ -748,7 +748,7 @@ async def entrypoint(ctx: JobContext):
             inference.TTS(
                 model="fishaudio/s2.1-pro-free",
                 voice="v_XSvqo8UVEFYo",#"v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-                extra_kwargs={"speed": 1.15, "temperature": 0, "latency": "normal"},
+                extra_kwargs={"speed": 1.15, "temperature": 0.2, "latency": "normal"},
             ),
             #build_azure_tts(),
             #build_elevenlabs_tts(),
@@ -853,7 +853,7 @@ async def entrypoint(ctx: JobContext):
         room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation_model),
     )
 
-    # Background ambient office noise so Fola sounds like a real call-center
+    # Background ambient office noise so Mary sounds like a real call-center
     # agent rather than speaking from a silent void. Was volume=0.3 — likely
     # too quiet to notice under phone-codec compression; LiveKit's own docs
     # examples all use 0.8. Bumped to 0.6 as a middle ground; tune from here
@@ -988,11 +988,11 @@ if __name__ == "__main__":
     # AZURE_SPEECH_REGION + ELEVENLABS_API_KEY (+ Firebase creds for call
     # recording, unrelated to voice AI billing).
     #
-    # agent_name="fola" is required because the SIP dispatch rule
-    # (roomConfig.agents: [{"agentName": "fola"}]) uses explicit/named
+    # agent_name="Mary" is required because the SIP dispatch rule
+    # (roomConfig.agents: [{"agentName": "Mary"}]) uses explicit/named
     # dispatch. Without a matching agent_name here, this worker only
     # registers for automatic dispatch and never receives jobs from that
     # rule — the dispatch name below must match the dispatch rule exactly.
     cli.run_app(
-        WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, agent_name="fola")
+        WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, agent_name="Mary")
     )
