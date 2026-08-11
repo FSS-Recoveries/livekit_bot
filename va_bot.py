@@ -654,7 +654,7 @@ async def entrypoint(ctx: JobContext):
         with open(prompt_path, "r", encoding="utf-8") as f:
             system_prompt = f.read().strip()
     except FileNotFoundError:
-        system_prompt = "You are Kolawole, a debt collection assistant."
+        system_prompt = "You are Mary, a debt collection assistant."
 
     # Providers — STT and LLM via LiveKit Inference (livekit.agents.inference),
     # billed through your LiveKit Cloud account: no DEEPGRAM_API_KEY,
@@ -668,7 +668,7 @@ async def entrypoint(ctx: JobContext):
     # ElevenLabs errors out mid-call.
     stt = agents_stt.FallbackAdapter(
         [
-            #inference.STT("elevenlabs/scribe_v2_realtime"),
+            inference.STT("elevenlabs/scribe_v2_realtime", language="en"),
             inference.STT("deepgram/nova-3", language="en"),
             #inference.STT("elevenlabs/scribe_v2_realtime"),
         ]
