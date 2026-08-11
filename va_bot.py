@@ -536,7 +536,15 @@ def _get_caller_phone_number(participant: "rtc.RemoteParticipant | None") -> str
 
 
 # ── Pre-recorded greeting (bypasses TTS) ─────────────────────────────────
-GREETING_WAV_PATH = os.path.join(os.getcwd(), "Greeting v2.wav")
+GREETING_WAV_PATH = os.path.join(os.getcwd(), "Greeting.wav")
+# Fallback bridge clip: played once if the agent still hasn't spoken again
+# OPENING_STALL_DELAY_SECONDS after GREETING_WAV_PATH finishes (customer
+# info / AMD still resolving).
+GREETING_V2_WAV_PATH = os.path.join(os.getcwd(), "Greeting v2.wav")
+OPENING_STALL_DELAY_SECONDS = 4
+# From the agent's first real turn onward, how long it can sit "thinking"
+# before speaking a short "Hmm" filler while the real reply keeps loading.
+HMM_FILLER_DELAY_SECONDS = 4
 
 
 async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
@@ -602,6 +610,8 @@ async def entrypoint(ctx: JobContext):
     transcript_lines: list[str] = []
     egress_task = asyncio.create_task(_start_call_recording(ctx))
     max_duration_task: asyncio.Task | None = None
+    opening_stall_task: asyncio.Task | None = None
+    hmm_filler_task: asyncio.Task | None = None
 
     async def _on_shutdown():
         # ctx.shutdown() (used everywhere we decide to end the call) only
@@ -621,6 +631,10 @@ async def entrypoint(ctx: JobContext):
         # otherwise it's still sleeping and would fire pointlessly later.
         if max_duration_task is not None:
             max_duration_task.cancel()
+        if opening_stall_task is not None:
+            opening_stall_task.cancel()
+        if hmm_filler_task is not None:
+            hmm_filler_task.cancel()
 
         egress_info = await egress_task
         recording_url = await _finish_call_recording(ctx, egress_info)
@@ -717,7 +731,7 @@ async def entrypoint(ctx: JobContext):
             inference.TTS(
                 model="fishaudio/s2.1-pro",
                 voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-                extra_kwargs={"speed": 1.13, "temperature": 0, "latency": "normal"},
+                extra_kwargs={"speed": 1, "temperature": 0, "latency": "normal"},
             ),
             #build_azure_tts(),
             build_elevenlabs_tts(),
@@ -753,6 +767,44 @@ async def entrypoint(ctx: JobContext):
             transcript_lines.append(f"{role}: {text}")
 
     session.on("conversation_item_added", _on_conversation_item_added)
+
+    # Two-tier "the bot has gone quiet too long" filler system:
+    #   - Before the agent's first real turn (the raw-track WAV greeting
+    #     below doesn't count — it bypasses this session's TTS entirely):
+    #     OPENING_STALL_DELAY_SECONDS of silence after that WAV greeting
+    #     finishes triggers a second pre-recorded WAV bridge clip, since
+    #     customer-info lookup / AMD may still be resolving.
+    #   - From the agent's first real turn onward: HMM_FILLER_DELAY_SECONDS
+    #     of silence during any "thinking" state triggers a short spoken
+    #     "Hmm" filler via normal TTS instead, re-arming for as long as that
+    #     turn keeps thinking.
+    # Both are cancelled the instant the agent actually starts speaking.
+    first_response_delivered = False
+
+    async def _play_opening_stall_after_delay() -> None:
+        await asyncio.sleep(OPENING_STALL_DELAY_SECONDS)
+        await _play_wav_greeting(ctx.room, GREETING_V2_WAV_PATH)
+
+    async def _speak_hmm_after_delay() -> None:
+        await asyncio.sleep(HMM_FILLER_DELAY_SECONDS)
+        session.say("Hmm,", allow_interruptions=True)
+
+    def _on_agent_state_changed(ev) -> None:
+        nonlocal first_response_delivered, opening_stall_task, hmm_filler_task
+        if ev.new_state == "speaking" and not first_response_delivered:
+            first_response_delivered = True
+            if opening_stall_task is not None and not opening_stall_task.done():
+                opening_stall_task.cancel()
+            return
+        if not first_response_delivered:
+            return
+        if ev.new_state == "thinking":
+            if hmm_filler_task is None or hmm_filler_task.done():
+                hmm_filler_task = asyncio.create_task(_speak_hmm_after_delay())
+        elif hmm_filler_task is not None and not hmm_filler_task.done():
+            hmm_filler_task.cancel()
+
+    session.on("agent_state_changed", _on_agent_state_changed)
 
     # Build the initial instructions synchronously — no blocking wait on the
     # customer lookup here. This previously did `await asyncio.wait_for(
@@ -884,11 +936,13 @@ async def entrypoint(ctx: JobContext):
             allow_interruptions=True,
         )
     else:
-        # Nothing is said after this — the LLM only fires once STT/VAD
-        # detects the caller's reply, so the agent naturally stays silent
-        # until they actually respond, then follows the prompt's own
-        # Opening Flow script via normal TTS.
+        # The WAV greeting bypasses this session's TTS entirely, so the
+        # agent stays silent (from the session's own point of view) through
+        # it, then through AMD. `opening_stall_task` covers that whole
+        # window: if the agent still hasn't spoken for real 6s after the
+        # WAV finishes, it plays a second bridge clip.
         await _play_wav_greeting(ctx.room, GREETING_WAV_PATH)
+        opening_stall_task = asyncio.create_task(_play_opening_stall_after_delay())
 
         # `wait_until_finished=False` caps detection at the 20s timeout even
         # if the caller talks continuously without a clean pause —
@@ -904,16 +958,26 @@ async def entrypoint(ctx: JobContext):
         call_state["amd_category"] = result.category.value
 
         if result.category == AMDCategory.MACHINE_VM:
+            opening_stall_task.cancel()
             ctx.shutdown(reason="voicemail detected")
             return
         elif result.category == AMDCategory.MACHINE_UNAVAILABLE:
+            opening_stall_task.cancel()
             ctx.shutdown(reason="mailbox unavailable")
             return
         elif result.category == AMDCategory.MACHINE_IVR:
             # AMD's built-in IVR navigation already kicked off inside
-            # execute(); nothing further to do here.
-            pass
-        # human/uncertain: greeting was already played above.
+            # execute(); nothing further to do here — and no proactive
+            # human-facing greeting should play into an automated menu.
+            opening_stall_task.cancel()
+        else:
+            # human/uncertain: greeting was already played above. Have the
+            # agent proactively deliver its real opening line now (per
+            # prompt.txt's Opening Flow) instead of waiting for the caller
+            # to speak first. Guarded in case the caller already spoke
+            # during AMD and the agent already responded on its own.
+            if not first_response_delivered:
+                session.generate_reply()
 
     # Silence safety net: the LLM only reacts to turns, so if the customer
     # goes quiet it can't act on its own. After user_away_timeout (15s
@@ -929,9 +993,10 @@ async def entrypoint(ctx: JobContext):
             return
         if not checked_in:
             checked_in = True
-            asyncio.create_task(
-                session.say("Are you still with me?", allow_interruptions=True)
-            )
+            # session.say() returns a SpeechHandle (already queued/running,
+            # not a coroutine) — wrapping it in asyncio.create_task() raises
+            # TypeError, so it's called directly, fire-and-forget.
+            session.say("Are you still with me?", allow_interruptions=True)
         else:
             ctx.shutdown(reason="no response after silence check")
 
