@@ -564,7 +564,7 @@ GREETING_WAV_PATH = os.path.join(os.getcwd(), "Greeting.wav")
 # OPENING_STALL_DELAY_SECONDS after GREETING_WAV_PATH finishes (customer
 # info / AMD still resolving).
 GREETING_V2_WAV_PATH = os.path.join(os.getcwd(), "Greeting v2.wav")
-OPENING_STALL_DELAY_SECONDS = 6
+OPENING_STALL_DELAY_SECONDS = 4
 # From the agent's first real turn onward, how long it can sit "thinking"
 # before speaking a short "Hmm" filler while the real reply keeps loading.
 HMM_FILLER_DELAY_SECONDS = 4
@@ -959,14 +959,19 @@ async def entrypoint(ctx: JobContext):
             allow_interruptions=True,
         )
     else:
-        # The WAV greeting bypasses this session's TTS entirely, so the
-        # agent stays silent (from the session's own point of view) through
-        # it, then through AMD. `opening_stall_task` covers that whole
-        # window: if the agent still hasn't spoken for real 6s after the
-        # WAV finishes, it plays a second bridge clip.
-        await _play_wav_greeting(ctx.room, GREETING_WAV_PATH)
-        opening_stall_task = asyncio.create_task(_play_opening_stall_after_delay())
-
+        # AMD.__aenter__() pauses the session's normal auto-reply
+        # authorization the instant it's entered — that's what keeps a
+        # reply to the caller's speech from playing out mid-classification.
+        # Entering AMD *before* the WAV greeting (not after) makes that lock
+        # cover the greeting too: if the caller says something while
+        # Greeting.wav is still playing — very common, most people speak the
+        # instant they pick up — a reply can't leak out and overlap it. The
+        # WAV greeting itself still bypasses this session's TTS entirely, so
+        # from the session's own point of view the agent stays silent
+        # through it, then through AMD. `opening_stall_task` covers that
+        # whole window: if the agent still hasn't spoken for real 6s after
+        # the WAV finishes, it plays a second bridge clip.
+        #
         # `wait_until_finished=False` caps detection at the 20s timeout even
         # if the caller talks continuously without a clean pause —
         # otherwise AMD extends indefinitely waiting for silence.
@@ -977,6 +982,8 @@ async def entrypoint(ctx: JobContext):
             suppress_compatibility_warning=True,
             wait_until_finished=False,
         ) as detector:
+            await _play_wav_greeting(ctx.room, GREETING_WAV_PATH)
+            opening_stall_task = asyncio.create_task(_play_opening_stall_after_delay())
             result = await detector.execute()
         call_state["amd_category"] = result.category.value
 
@@ -994,13 +1001,20 @@ async def entrypoint(ctx: JobContext):
             # human-facing greeting should play into an automated menu.
             opening_stall_task.cancel()
         else:
-            # human/uncertain: greeting was already played above. Have the
-            # agent proactively deliver its real opening line now (per
-            # prompt.txt's Opening Flow) instead of waiting for the caller
-            # to speak first. Guarded in case the caller already spoke
-            # during AMD and the agent already responded on its own.
-            if not first_response_delivered:
-                session.generate_reply()
+            # human/uncertain: greeting was already played above; nothing
+            # more to trigger here. AMD._on_end_of_turn only skips the
+            # session's normal auto-reply pipeline once it has already
+            # decided "machine" — for human/uncertain that pipeline runs as
+            # usual, just gated behind AMD's authorization lock, which
+            # execute() eagerly releases as soon as a verdict is in ("so
+            # agent can speak immediately to a human"). So: if the caller
+            # already said something during the WAV greeting or AMD, a
+            # reply is already queued and plays the instant that lock
+            # lifts — respond ASAP, no extra call needed. If the caller
+            # hasn't spoken yet, nothing is queued, and correctly so —
+            # opening_stall_task/GREETING_V2_WAV_PATH is the only thing
+            # that covers the silence until they do.
+            pass
 
     # Silence safety net: the LLM only reacts to turns, so if the customer
     # goes quiet it can't act on its own. After user_away_timeout (15s
