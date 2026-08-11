@@ -592,7 +592,7 @@ async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
 # Inference defaults a segment's confidence to 1.0 when a provider doesn't
 # report one at all, so providers that don't report confidence won't get
 # stuck re-asking on every turn.
-STT_CONFIDENCE_THRESHOLD = float(os.getenv("STT_CONFIDENCE_THRESHOLD", "0.70"))
+STT_CONFIDENCE_THRESHOLD = float(os.getenv("STT_CONFIDENCE_THRESHOLD", "0.50"))
 
 # Varied so repeated low-confidence turns in the same call don't all get the
 # identical canned line — reads as a person, not a script re-firing.
