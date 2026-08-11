@@ -754,7 +754,7 @@ async def entrypoint(ctx: JobContext):
     tts = agents_tts.FallbackAdapter(
         [
             inference.TTS(
-                model="fishaudio/s2.1-pro-free",
+                model="fishaudio/s2.1-pro",
                 voice="v_XSvqo8UVEFYo",#"v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
                 extra_kwargs={"speed": 1.15, "temperature": 0.0, "latency": "normal"},
             ),
