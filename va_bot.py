@@ -6,7 +6,6 @@ import requests
 import inspect
 import time
 import uuid
-import wave
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -535,55 +534,6 @@ def _get_caller_phone_number(participant: "rtc.RemoteParticipant | None") -> str
     return participant.attributes.get("sip.phoneNumber")
 
 
-# ── Pre-recorded greeting (bypasses TTS) ─────────────────────────────────
-GREETING_WAV_PATH = os.path.join(os.getcwd(), "Greeting.wav")
-
-
-async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
-    """Publishes a pre-recorded WAV directly to the room as a raw audio
-    track, bypassing TTS entirely. Avoids TTS cold-start latency (and any
-    single provider's outage) for this one fixed opening line. The agent
-    stays silent until the caller actually replies, since nothing here
-    touches the LLM/STT turn-taking pipeline."""
-    if not os.path.exists(wav_path):
-        print(f"Greeting WAV not found at {wav_path}; skipping.")
-        return
-
-    with wave.open(wav_path, "rb") as wf:
-        sample_rate = wf.getframerate()
-        num_channels = wf.getnchannels()
-        sample_width = wf.getsampwidth()
-        if sample_width != 2:
-            print(f"Greeting WAV must be 16-bit PCM, got {sample_width * 8}-bit; skipping.")
-            return
-
-        source = rtc.AudioSource(sample_rate, num_channels)
-        track = rtc.LocalAudioTrack.create_audio_track("greeting", source)
-        publication = await room.local_participant.publish_track(track)
-
-        frame_ms = 20
-        frame_samples = int(sample_rate * frame_ms / 1000)
-        bytes_per_frame = frame_samples * num_channels * sample_width
-
-        try:
-            while True:
-                chunk = wf.readframes(frame_samples)
-                if not chunk:
-                    break
-                if len(chunk) < bytes_per_frame:
-                    chunk += b"\x00" * (bytes_per_frame - len(chunk))
-                audio_frame = rtc.AudioFrame(
-                    data=chunk,
-                    sample_rate=sample_rate,
-                    num_channels=num_channels,
-                    samples_per_channel=len(chunk) // (2 * num_channels),
-                )
-                await source.capture_frame(audio_frame)
-        finally:
-            await asyncio.sleep(0.5)
-            await room.local_participant.unpublish_track(publication.sid)
-
-
 # ── Entrypoint ──────────────────────────────────────────────────────────
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
@@ -715,8 +665,8 @@ async def entrypoint(ctx: JobContext):
         [
             inference.TTS(
                 model="fishaudio/s2.1-pro",
-                voice="v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-                extra_kwargs={"speed": 1.15, "temperature": 0.0, "latency": "normal"},
+                voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
+                extra_kwargs={"speed": 1.15, "temperature": 0.0, "latency": "low"},
             ),
             #build_azure_tts(),
             #build_elevenlabs_tts(),
@@ -862,16 +812,21 @@ async def entrypoint(ctx: JobContext):
 
     # Greeting first, then Answering Machine Detection. Previously AMD ran
     # before anything was said (to avoid talking over a voicemail greeting);
-    # this now plays the pre-recorded greeting immediately so the caller
-    # hears something right away instead of waiting through AMD's
-    # classification window. Tradeoff: on a real voicemail/IVR line, the
-    # greeting audio plays before we know that and hang up/navigate — AMD
-    # still runs right after and still cuts the call short in those cases,
-    # just after the greeting rather than before it.
+    # this now speaks a generic greeting immediately so the caller hears
+    # something right away instead of waiting through AMD's classification
+    # window. Tradeoff: on a real voicemail/IVR line, the greeting plays
+    # before we know that and hang up/navigate — AMD still runs right after
+    # and still cuts the call short in those cases, just after the greeting
+    # rather than before it.
+    #
+    # The greeting is a fixed, generic line spoken via the session's normal
+    # TTS (no pre-recorded WAV) so it works with whatever voice/provider is
+    # configured. `lookup_task` (the customer snapshot fetch) was already
+    # kicked off as soon as the phone number was known, well before this
+    # point, so it runs concurrently with the greeting rather than after it.
     if is_console:
-        # Console mode has no SIP participant/greeting WAV workflow, and no
-        # answering-machine scenario when testing with your own mic — keep
-        # the simple TTS line, no AMD.
+        # Console mode has no SIP participant/answering-machine scenario
+        # when testing with your own mic — keep the simple TTS line, no AMD.
         result = None
         call_state["amd_category"] = "skipped_console"
         await session.say(
@@ -883,7 +838,10 @@ async def entrypoint(ctx: JobContext):
         # detects the caller's reply, so the agent naturally stays silent
         # until they actually respond, then follows the prompt's own
         # Opening Flow script via normal TTS.
-        await _play_wav_greeting(ctx.room, GREETING_WAV_PATH)
+        await session.say(
+            "Hello, thank you for taking our call.",
+            allow_interruptions=True,
+        )
 
         # `wait_until_finished=False` caps detection at the 20s timeout even
         # if the caller talks continuously without a clean pause —
