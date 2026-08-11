@@ -19,4 +19,5 @@ dependencies = [
     "livekit-plugins-silero==1.6.7",
     "python-dotenv>=1.0.1",
     "requests>=2.32.0",
+    "tzdata>=2026.3",
 ]

@@ -8,6 +8,7 @@ import time
 import uuid
 import wave
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from livekit import rtc
@@ -373,6 +374,28 @@ async def get_customer_info(ctx: RunContext, phone_number: str) -> str:
 async def end_call(ctx: RunContext) -> None:
     await ctx.wait_for_playout()
     get_job_context().shutdown(reason="call ended by agent")
+
+
+_LAGOS_TZ = ZoneInfo("Africa/Lagos")
+
+
+@function_tool(
+    description=(
+        "Get the current date and time in Nigeria (Africa/Lagos, West Africa Time). "
+        "Call this whenever you need today's actual date to reason about relative "
+        "dates or deadlines — e.g. converting something the customer says ('this "
+        "Friday', 'end of month', 'tomorrow') into an exact calendar date, checking "
+        "whether an existing ptp_date has already passed, or checking whether today "
+        "is Sunday for the discount lock-in window. Never guess, assume, or rely on "
+        "your training data for today's date — always call this instead."
+    )
+)
+async def get_current_datetime(ctx: RunContext) -> str:
+    now = datetime.now(_LAGOS_TZ)
+    return (
+        f"Current date and time: {now.strftime('%A, %B %d, %Y, %I:%M %p')} "
+        f"West Africa Time. ISO date: {now.date().isoformat()}."
+    )
 
 
 # ── Version-safe ElevenLabs TTS builder ─────────────────────────────────
@@ -830,7 +853,7 @@ async def entrypoint(ctx: JobContext):
     # Agent with tools
     agent = Agent(
         instructions=system_prompt,
-        tools=[get_customer_info, end_call],
+        tools=[get_customer_info, end_call, get_current_datetime],
     )
 
     async def _apply_customer_lookup_result() -> None:
