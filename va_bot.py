@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import os
+import random
 import re
 import requests
 import inspect
@@ -29,6 +30,7 @@ from livekit.agents import (
     BackgroundAudioPlayer,
     AudioConfig,
     BuiltinAudioClip,
+    StopResponse,
 )
 from livekit.agents.inference import TurnDetector
 from livekit.agents.metrics import ModelUsageCollector
@@ -576,6 +578,44 @@ async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
             await room.local_participant.unpublish_track(publication.sid)
 
 
+# ── Low-confidence transcript handling ───────────────────────────────────
+# STT confidence below this triggers a "can you repeat that?" instead of
+# letting the LLM guess at a garbled transcript. Tune via env var; LiveKit
+# Inference defaults a segment's confidence to 1.0 when a provider doesn't
+# report one at all, so providers that don't report confidence won't get
+# stuck re-asking on every turn.
+STT_CONFIDENCE_THRESHOLD = float(os.getenv("STT_CONFIDENCE_THRESHOLD", "0.70"))
+
+# Varied so repeated low-confidence turns in the same call don't all get the
+# identical canned line — reads as a person, not a script re-firing.
+LOW_CONFIDENCE_PROMPTS = [
+    "Sorry — could you say that again?",
+    "Sorry, I didn't catch that — can you repeat it?",
+    "Could you say that one more time?",
+    "I missed that — could you repeat it?",
+    "Sorry, come again?",
+    "I didn't quite get that — one more time?",
+]
+
+
+class RecoveriesAgent(Agent):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._last_low_confidence_prompt: str | None = None
+
+    async def on_user_turn_completed(
+        self, turn_ctx: agents_llm.ChatContext, new_message: agents_llm.ChatMessage
+    ) -> None:
+        confidence = new_message.transcript_confidence
+        if confidence is not None and confidence < STT_CONFIDENCE_THRESHOLD:
+            print(f"Low STT confidence ({confidence:.2f}), asking customer to repeat.")
+            choices = [p for p in LOW_CONFIDENCE_PROMPTS if p != self._last_low_confidence_prompt]
+            prompt = random.choice(choices)
+            self._last_low_confidence_prompt = prompt
+            self.session.say(prompt)
+            raise StopResponse()
+
+
 # ── Entrypoint ──────────────────────────────────────────────────────────
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
@@ -767,7 +807,7 @@ async def entrypoint(ctx: JobContext):
         )
 
     # Agent with tools
-    agent = Agent(
+    agent = RecoveriesAgent(
         instructions=system_prompt,
         tools=[get_customer_info, end_call],
     )
