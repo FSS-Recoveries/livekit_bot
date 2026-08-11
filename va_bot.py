@@ -839,7 +839,7 @@ async def entrypoint(ctx: JobContext):
         # until they actually respond, then follows the prompt's own
         # Opening Flow script via normal TTS.
         await session.say(
-            "Hello, thank you for taking our call.",
+            "Hello, I'm getting your details.",
             allow_interruptions=True,
         )
 
