@@ -1047,9 +1047,17 @@ async def entrypoint(ctx: JobContext):
 
     session.on("user_state_changed", _on_user_state_changed)
 
-    # Keep alive
-    while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
-        await asyncio.sleep(1)
+    # No keep-alive loop here on purpose. The call's actual lifetime is
+    # governed by the job's internal shutdown future (set by ctx.shutdown()
+    # or the room disconnecting on its own) — entirely independent of
+    # whether entrypoint() itself has returned. session event listeners and
+    # background tasks (max_duration_task, silence checks, etc.) keep
+    # running either way. A `while connection_state == CONNECTED: sleep(1)`
+    # loop here would actively hurt: the job runner waits (up to 15s) for
+    # this task to finish before it disconnects the room on shutdown, and
+    # that loop only exits once the room disconnects — a circular wait that
+    # stalls every hangup (end_call, max call duration, silence timeout) by
+    # up to 15 real seconds for no benefit.
 
 
 def prewarm(proc):
