@@ -668,8 +668,8 @@ async def entrypoint(ctx: JobContext):
     # ElevenLabs errors out mid-call.
     stt = agents_stt.FallbackAdapter(
         [
-            inference.STT("elevenlabs/scribe_v2_realtime"),
-            #inference.STT("deepgram/nova-3", language="multi"),
+            #inference.STT("elevenlabs/scribe_v2_realtime"),
+            inference.STT("deepgram/nova-3", language="en"),
             #inference.STT("elevenlabs/scribe_v2_realtime"),
         ]
     )
