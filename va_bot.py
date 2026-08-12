@@ -915,7 +915,7 @@ async def entrypoint(ctx: JobContext):
     # here since this only plays into the outbound track, but worth knowing
     # if it starts sounding intrusive).
     background_audio = BackgroundAudioPlayer(
-        ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.7),
+        ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.8),
     )
     await background_audio.start(room=ctx.room, agent_session=session)
 
