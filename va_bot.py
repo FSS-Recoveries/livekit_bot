@@ -568,6 +568,9 @@ OPENING_STALL_DELAY_SECONDS = 4
 # From the agent's first real turn onward, how long it can sit "thinking"
 # before speaking a short "Hmm" filler while the real reply keeps loading.
 HMM_FILLER_DELAY_SECONDS = 4
+# How long to wait after the "Are you still with me?" check-in before
+# giving up and hanging up, if the caller still hasn't responded.
+SILENCE_SHUTDOWN_DELAY_SECONDS = 15
 
 
 async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
@@ -635,6 +638,7 @@ async def entrypoint(ctx: JobContext):
     max_duration_task: asyncio.Task | None = None
     opening_stall_task: asyncio.Task | None = None
     hmm_filler_task: asyncio.Task | None = None
+    silence_shutdown_task: asyncio.Task | None = None
 
     async def _on_shutdown():
         # ctx.shutdown() (used everywhere we decide to end the call) only
@@ -658,6 +662,8 @@ async def entrypoint(ctx: JobContext):
             opening_stall_task.cancel()
         if hmm_filler_task is not None:
             hmm_filler_task.cancel()
+        if silence_shutdown_task is not None:
+            silence_shutdown_task.cancel()
 
         egress_info = await egress_task
         recording_url = await _finish_call_recording(ctx, egress_info)
@@ -1026,15 +1032,26 @@ async def entrypoint(ctx: JobContext):
 
     # Silence safety net: the LLM only reacts to turns, so if the customer
     # goes quiet it can't act on its own. After user_away_timeout (15s
-    # default) of no user activity, check in once per the prompt's silence
-    # rule; if they're still away after a second consecutive check, hang up
-    # instead of holding the line open indefinitely.
+    # default) of no user activity, check in once.
+    #
+    # This does NOT wait for a second "away" event to decide whether to hang
+    # up — the framework's away-timer is one-shot and only re-arms when the
+    # agent and user both transition INTO "listening" at the same moment.
+    # Once state is "away", nothing routine flips it back: under genuine
+    # silence it just sticks, so a second "away" event may never arrive at
+    # all; on a noisy line, a stray STT final-transcript resets away→listening
+    # as a VAD-miss safety net, which can accidentally re-arm the timer —
+    # unpredictable either way. So instead: on the first "away", start our
+    # own plain timer: if the caller hasn't spoken by the time it fires,
+    # hang up, regardless of what the framework's own state does next.
     checked_in = False
 
     def _on_user_state_changed(ev):
-        nonlocal checked_in
+        nonlocal checked_in, silence_shutdown_task
         if ev.new_state != "away":
             checked_in = False
+            if silence_shutdown_task is not None and not silence_shutdown_task.done():
+                silence_shutdown_task.cancel()
             return
         if not checked_in:
             checked_in = True
@@ -1042,8 +1059,11 @@ async def entrypoint(ctx: JobContext):
             # not a coroutine) — wrapping it in asyncio.create_task() raises
             # TypeError, so it's called directly, fire-and-forget.
             session.say("Are you still with me?", allow_interruptions=True)
-        else:
-            ctx.shutdown(reason="no response after silence check")
+            silence_shutdown_task = asyncio.create_task(_shutdown_after_silence())
+
+    async def _shutdown_after_silence() -> None:
+        await asyncio.sleep(SILENCE_SHUTDOWN_DELAY_SECONDS)
+        ctx.shutdown(reason="no response after silence check")
 
     session.on("user_state_changed", _on_user_state_changed)
 
