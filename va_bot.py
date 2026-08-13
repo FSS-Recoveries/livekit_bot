@@ -379,7 +379,41 @@ async def get_customer_info(ctx: RunContext, phone_number: str) -> str:
 )
 async def end_call(ctx: RunContext) -> None:
     await ctx.wait_for_playout()
-    get_job_context().shutdown(reason="call ended by agent")
+    job_ctx = get_job_context()
+    job_ctx.shutdown(reason="call ended by agent")
+    asyncio.create_task(_ensure_call_ends(job_ctx))
+
+
+# ctx.shutdown() only signals the job runner to *start* an async teardown
+# (wait for the entrypoint task, session.aclose(), room.disconnect(), then
+# our own shutdown callback's ctx.delete_room() — the actual SIP hangup).
+# If any step in that chain stalls, the call stays connected and the agent
+# keeps responding to the customer indefinitely, even though end_call
+# already ran. Rather than trust that chain to always complete, check back
+# after a grace period and, if the room is still connected, force the
+# actual hangup directly and re-signal shutdown — retrying a few times in
+# case the stall (or the retry itself) was transient.
+_END_CALL_RETRY_DELAY_SECONDS = 5
+_END_CALL_MAX_RETRIES = 3
+
+
+async def _ensure_call_ends(job_ctx: JobContext) -> None:
+    for attempt in range(1, _END_CALL_MAX_RETRIES + 1):
+        await asyncio.sleep(_END_CALL_RETRY_DELAY_SECONDS)
+        if job_ctx.room.connection_state != rtc.ConnectionState.CONN_CONNECTED:
+            return  # call actually ended; nothing more to do
+        print(
+            f"end_call: room still connected {attempt * _END_CALL_RETRY_DELAY_SECONDS}s "
+            f"after shutdown was requested; forcing hangup directly (attempt {attempt})"
+        )
+        try:
+            await job_ctx.delete_room()
+        except Exception as e:
+            print(f"end_call retry: failed to delete room: {e}")
+        job_ctx.shutdown(reason="call ended by agent (retry)")
+
+    if job_ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
+        print("end_call: room still connected after all retries; giving up")
 
 
 _LAGOS_TZ = ZoneInfo("Africa/Lagos")
@@ -766,7 +800,7 @@ async def entrypoint(ctx: JobContext):
             inference.TTS(
                 model="fishaudio/s2.1-pro",
                 voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-                extra_kwargs={"speed": 1.15, "temperature": 0, "latency": "normal"},
+                extra_kwargs={"speed": 1.15, "temperature": 0.4, "latency": "normal"},
             ),
 
             build_elevenlabs_tts(),
