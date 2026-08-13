@@ -764,17 +764,20 @@ async def entrypoint(ctx: JobContext):
     tts = agents_tts.FallbackAdapter(
         [
             inference.TTS(
-                model="inworld/inworld-tts-1.5-mini",
-                voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-                extra_kwargs={"speaking_rate": 1.3, "temperature": 0, "latency": "normal"},
-                ),
-            inference.TTS(
                 model="fishaudio/s2.1-pro",
                 voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
                 extra_kwargs={"speed": 1.15, "temperature": 0, "latency": "normal"},
             ),
+
+            build_elevenlabs_tts(),
+
+            #inference.TTS(
+                #model="inworld/inworld-tts-1.5-mini",
+                #voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
+                #extra_kwargs={"speaking_rate": 1.3, "temperature": 0, "latency": "normal"},
+                #),
             #build_azure_tts(),
-            #build_elevenlabs_tts(),
+            
             
         ],
         # 0: on any mid-stream failure, switch to the next TTS immediately
