@@ -8,6 +8,7 @@ import time
 import uuid
 import wave
 from datetime import datetime, timezone
+from urllib.parse import quote as _urlquote
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
@@ -179,7 +180,12 @@ async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
         token = str(uuid.uuid4())
         blob.metadata = {"firebaseStorageDownloadTokens": token}
         blob.patch()
-        encoded_path = filepath.replace("/", "%2F")
+        # Full percent-encoding, not just "/" -> "%2F": room names contain a
+        # literal "+" from the E.164 phone number (e.g. call-_+234...), and
+        # an un-encoded "+" in the URL causes Firebase Storage to 404 even
+        # though the object exists — every real call's recording_url was
+        # broken by this until it was caught.
+        encoded_path = _urlquote(filepath, safe="")
         return (
             f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_STORAGE_BUCKET}"
             f"/o/{encoded_path}?alt=media&token={token}"
