@@ -803,6 +803,12 @@ async def entrypoint(ctx: JobContext):
                 extra_kwargs={"speed": 1.2, "temperature": 0, "latency": "normal"},
             ),
 
+            inference.TTS(
+                model="inworld/inworld-tts-1.5-max",
+                voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
+                extra_kwargs={"speaking_rate": 1.4, "temperature": 0, "latency": "normal"},
+                ),
+                
             build_elevenlabs_tts(),
 
             #inference.TTS(
@@ -846,11 +852,20 @@ async def entrypoint(ctx: JobContext):
     session.on("metrics_collected", lambda ev: usage_collector.collect(ev.metrics))
 
     def _on_conversation_item_added(ev):
+        nonlocal hmm_filler_task
         item = ev.item
         role = getattr(item, "role", None)
         text = getattr(item, "text_content", None)
         if role and text:
             transcript_lines.append(f"{role}: {text}")
+        # Belt-and-suspenders: a real assistant utterance just landed, so any
+        # pending "Hmm" filler is moot. Cancelling only on the "speaking"
+        # state transition isn't always enough — a slow/chunked TTS
+        # generation can bounce agent_state between "thinking" and
+        # "speaking" mid-turn, occasionally leaving a stale filler timer
+        # armed that then fires right after real content was just spoken.
+        if role == "assistant" and hmm_filler_task is not None and not hmm_filler_task.done():
+            hmm_filler_task.cancel()
 
     session.on("conversation_item_added", _on_conversation_item_added)
 
@@ -859,12 +874,19 @@ async def entrypoint(ctx: JobContext):
     #     below doesn't count — it bypasses this session's TTS entirely):
     #     OPENING_STALL_DELAY_SECONDS of silence after that WAV greeting
     #     finishes triggers a second pre-recorded WAV bridge clip, since
-    #     customer-info lookup / AMD may still be resolving.
-    #   - From the agent's first real turn onward: HMM_FILLER_DELAY_SECONDS
-    #     of silence during any "thinking" state triggers a short spoken
-    #     "Hmm" filler via normal TTS instead, re-arming for as long as that
-    #     turn keeps thinking.
-    # Both are cancelled the instant the agent actually starts speaking.
+    #     customer-info lookup / AMD may still be resolving. This covers the
+    #     window before the caller has said anything yet, so agent_state
+    #     isn't "thinking" and the Hmm filler below can't apply to it.
+    #   - Once the caller's first turn lands and the agent is "thinking" —
+    #     including the very first real reply, e.g. while get_customer_info
+    #     / get_current_datetime tool calls are running — HMM_FILLER_DELAY_SECONDS
+    #     of continuous "thinking" triggers a short spoken "Hmm" filler via
+    #     normal TTS, re-arming for as long as that turn keeps thinking.
+    # Both are cancelled the instant the agent actually starts speaking; the
+    # Hmm filler is also cancelled the moment a real assistant utterance is
+    # added to the transcript (see _on_conversation_item_added above), since
+    # a slow/chunked TTS generation can otherwise bounce agent_state between
+    # "thinking" and "speaking" mid-turn and leave a stale timer armed.
     first_response_delivered = False
 
     async def _play_opening_stall_after_delay() -> None:
@@ -873,16 +895,21 @@ async def entrypoint(ctx: JobContext):
 
     async def _speak_hmm_after_delay() -> None:
         await asyncio.sleep(HMM_FILLER_DELAY_SECONDS)
-        session.say("Hmm,", allow_interruptions=True)
+        # add_to_chat_ctx=False: this is a stalling interjection, not real
+        # dialogue — it must never enter the LLM's own conversation history,
+        # and if TTS happens to be down when this fires, it must not leave a
+        # phantom "assistant said this" line in the transcript either.
+        session.say("Hmm,", allow_interruptions=True, add_to_chat_ctx=False)
 
     def _on_agent_state_changed(ev) -> None:
         nonlocal first_response_delivered, opening_stall_task, hmm_filler_task
-        if ev.new_state == "speaking" and not first_response_delivered:
-            first_response_delivered = True
-            if opening_stall_task is not None and not opening_stall_task.done():
-                opening_stall_task.cancel()
-            return
-        if not first_response_delivered:
+        if ev.new_state == "speaking":
+            if not first_response_delivered:
+                first_response_delivered = True
+                if opening_stall_task is not None and not opening_stall_task.done():
+                    opening_stall_task.cancel()
+            if hmm_filler_task is not None and not hmm_filler_task.done():
+                hmm_filler_task.cancel()
             return
         if ev.new_state == "thinking":
             if hmm_filler_task is None or hmm_filler_task.done():
