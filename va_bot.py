@@ -7,7 +7,7 @@ import inspect
 import time
 import uuid
 import wave
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote as _urlquote
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -479,20 +479,31 @@ _LAGOS_TZ = ZoneInfo("Africa/Lagos")
 
 @function_tool(
     description=(
-        "Get the current date and time in Nigeria (Africa/Lagos, West Africa Time). "
-        "Call this whenever you need today's actual date to reason about relative "
-        "dates or deadlines — e.g. converting something the customer says ('this "
-        "Friday', 'end of month', 'tomorrow') into an exact calendar date, checking "
-        "whether an existing ptp_date has already passed, or checking whether today "
-        "is Sunday for the discount lock-in window. Never guess, assume, or rely on "
-        "your training data for today's date — always call this instead."
+        "Get the current date and time in Nigeria (Africa/Lagos, West Africa Time), "
+        "plus the two standard payment deadline dates used throughout the offer "
+        "ladder and discount lock-in ('the 7-day deadline' and 'the 30-day "
+        "deadline' — 7 and 30 calendar days from this call, not the end of the "
+        "current week or calendar month). Call this once near the start of every "
+        "call, and again any time you need to reason about a relative date — "
+        "converting something the customer says ('this Friday', 'tomorrow') into "
+        "an exact calendar date, or checking whether an existing ptp_date has "
+        "already passed. Never guess, assume, do your own date arithmetic, or rely "
+        "on your training data for today's date or these deadlines — always call "
+        "this instead, and always speak the actual returned dates to the customer, "
+        "never the '7 days'/'30 days' reasoning behind them."
     )
 )
 async def get_current_datetime(ctx: RunContext) -> str:
     now = datetime.now(_LAGOS_TZ)
+    seven_day_deadline = now + timedelta(days=7)
+    thirty_day_deadline = now + timedelta(days=30)
     return (
         f"Current date and time: {now.strftime('%A, %B %d, %Y, %I:%M %p')} "
-        f"West Africa Time. ISO date: {now.date().isoformat()}."
+        f"West Africa Time. ISO date: {now.date().isoformat()}. "
+        f"7-day payment deadline (speak this exact date, never 'in 7 days' or "
+        f"'this week'): {seven_day_deadline.strftime('%A, %B %d, %Y')}. "
+        f"30-day payment deadline (speak this exact date, never 'in 30 days' or "
+        f"'end of month'): {thirty_day_deadline.strftime('%A, %B %d, %Y')}."
     )
 
 
@@ -668,7 +679,7 @@ OPENING_STALL_DELAY_SECONDS = 3
 HMM_FILLER_DELAY_SECONDS = 3
 # How long to wait after the "Are you still with me?" check-in before
 # giving up and hanging up, if the caller still hasn't responded.
-SILENCE_SHUTDOWN_DELAY_SECONDS = 15
+SILENCE_SHUTDOWN_DELAY_SECONDS = 10
 
 
 async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
