@@ -622,10 +622,10 @@ GREETING_WAV_PATH = os.path.join(os.getcwd(), "Greeting.wav")
 # OPENING_STALL_DELAY_SECONDS after GREETING_WAV_PATH finishes (customer
 # info / AMD still resolving).
 GREETING_V2_WAV_PATH = os.path.join(os.getcwd(), "Greeting v2.wav")
-OPENING_STALL_DELAY_SECONDS = 4
+OPENING_STALL_DELAY_SECONDS = 3
 # From the agent's first real turn onward, how long it can sit "thinking"
 # before speaking a short "Hmm" filler while the real reply keeps loading.
-HMM_FILLER_DELAY_SECONDS = 4
+HMM_FILLER_DELAY_SECONDS = 3
 # How long to wait after the "Are you still with me?" check-in before
 # giving up and hanging up, if the caller still hasn't responded.
 SILENCE_SHUTDOWN_DELAY_SECONDS = 15
@@ -917,7 +917,7 @@ async def entrypoint(ctx: JobContext):
         # dialogue — it must never enter the LLM's own conversation history,
         # and if TTS happens to be down when this fires, it must not leave a
         # phantom "assistant said this" line in the transcript either.
-        session.say("Hmm,", allow_interruptions=True, add_to_chat_ctx=False)
+        session.say("Hmm?", allow_interruptions=True, add_to_chat_ctx=False)
 
     def _on_agent_state_changed(ev) -> None:
         nonlocal first_response_delivered, opening_stall_task, hmm_filler_task
