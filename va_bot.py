@@ -352,6 +352,29 @@ def _save_call_record(
         print(f"Failed to save call record to Firestore: {e}")
 
 
+# ── Hearing-difficulty backstop (see _on_conversation_item_added) ───────
+# Real call transcripts showed the model NOT reliably applying its own
+# "3+ times → hearing-difficulty dead end" instruction — one real call ran
+# well past a dozen consecutive "Hello?"-only exchanges before ever
+# recognizing it. This is a deterministic, code-level backstop that doesn't
+# depend on the model noticing the pattern: every fragment of the
+# utterance (split on sentence punctuation, so "Hello? Hello. Good
+# afternoon." counts as three) must be nothing but a bare greeting for it
+# to count — any real content anywhere (a "yes", a number, a name) fails
+# the match, so genuine short answers are never caught by this.
+_GREETING_ONLY_PHRASES = {
+    "hello", "hi", "hey", "yo",
+    "good morning", "good afternoon", "good evening", "good day",
+    "who is this", "who is speaking", "who is calling",
+    "can you hear me", "are you there",
+}
+
+
+def _is_greeting_only_utterance(text: str) -> bool:
+    fragments = [f.strip() for f in re.split(r"[.?!]+", text.lower()) if f.strip()]
+    return bool(fragments) and all(f in _GREETING_ONLY_PHRASES for f in fragments)
+
+
 # ── Function tools ──────────────────────────────────────────────────────
 def _normalize_nigerian_phone(raw: str) -> str:
     """Strip non-digits, then convert 234XXXXXXXXXX → 0XXXXXXXXX."""
@@ -899,6 +922,23 @@ async def entrypoint(ctx: JobContext):
         tts=tts,
         turn_detection=TurnDetector(),
         preemptive_generation=True,
+        # Real call transcripts showed a repeating "Hello? Hello? Hello?"
+        # cascade: the customer says a bare "Hello?" mid-sentence, it cuts
+        # off Mary's current speech as a real interruption, she restarts,
+        # gets cut off again, and it loops. A 1-word utterance doesn't hit
+        # min_interruption_duration (0.5s default) reliably enough to be
+        # filtered by that alone. min_interruption_words=2 stops a single
+        # word like "Hello"/"Hi"/"Yes"/"No" from counting as an
+        # interruption at all — it only suppresses cutting Mary off
+        # mid-sentence; the transcript is still tracked, so if the customer
+        # keeps talking past 2 words it interrupts normally, and a bare
+        # "Hello?" that stops there still gets handled as the next turn
+        # once her current line finishes. Trade-off: genuine one-word
+        # interruptions ("Stop!", "Wait!") also won't cut her off
+        # instantly — they wait for her current (already short) sentence to
+        # finish rather than being lost. "Hold on" / "Wait, stop" (2+
+        # words) still interrupt immediately.
+        min_interruption_words=2,
     )
 
     # session.emit("metrics_collected", MetricsCollectedEvent(metrics=...)) wraps
@@ -906,8 +946,27 @@ async def entrypoint(ctx: JobContext):
     # so it must be unwrapped here or every call silently no-ops.
     session.on("metrics_collected", lambda ev: usage_collector.collect(ev.metrics))
 
+    # Deterministic backstop for the "Hello? Hello? Hello?" pattern found in
+    # real call transcripts — see _is_greeting_only_utterance above for why
+    # this doesn't depend on the model's own judgment. Consecutive, not a
+    # whole-call total: a call that recovers into a real conversation after
+    # a rocky start (which happens — seen in real data) must not be killed
+    # just because it had a few greeting-only turns much earlier.
+    HEARING_DIFFICULTY_BACKSTOP_THRESHOLD = 3
+    consecutive_greeting_only_turns = 0
+
+    async def _end_call_for_hearing_difficulty() -> None:
+        try:
+            await session.say(
+                "It seems we're having trouble hearing each other — I'll try you again another time.",
+                allow_interruptions=False,
+            )
+        except Exception as e:
+            print(f"Failed to speak hearing-difficulty backstop closing line: {e}")
+        ctx.shutdown(reason="hearing-difficulty backstop: repeated greeting-only exchanges")
+
     def _on_conversation_item_added(ev):
-        nonlocal hmm_filler_task
+        nonlocal hmm_filler_task, consecutive_greeting_only_turns
         item = ev.item
         role = getattr(item, "role", None)
         text = getattr(item, "text_content", None)
@@ -921,6 +980,13 @@ async def entrypoint(ctx: JobContext):
         # armed that then fires right after real content was just spoken.
         if role == "assistant" and hmm_filler_task is not None and not hmm_filler_task.done():
             hmm_filler_task.cancel()
+        if role == "user" and text:
+            if _is_greeting_only_utterance(text):
+                consecutive_greeting_only_turns += 1
+                if consecutive_greeting_only_turns >= HEARING_DIFFICULTY_BACKSTOP_THRESHOLD:
+                    asyncio.create_task(_end_call_for_hearing_difficulty())
+            else:
+                consecutive_greeting_only_turns = 0
 
     session.on("conversation_item_added", _on_conversation_item_added)
 
