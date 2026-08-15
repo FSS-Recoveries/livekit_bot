@@ -195,26 +195,28 @@ async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
         return None
 
 
-# ⚠️ STALE AS OF THE INFERENCE SWITCH: every rate below was the direct
-# provider's own API price (OpenAI/Google/ElevenLabs/Deepgram billing you
-# directly). Now that stt/llm/tts all go through LiveKit Inference
-# (livekit.agents.inference), you're billed at LiveKit's own Inference rate
-# card instead — which is not confirmed to be identical to these numbers —
-# and the `provider`/`model` strings these usage entries actually contain
-# once routed through the gateway haven't been re-verified either (matching
-# below may now silently return None for everything, or match against the
-# wrong rate). Check LiveKit Cloud's own usage/billing dashboard for real
-# figures; treat this function as unverified until checked against a real
-# post-switch usage entry and LiveKit's published Inference pricing.
+# Rates below are LiveKit's own Inference rate card (Build/Ship plan),
+# sourced directly from livekit.com/pricing/inference as of 2026-08-12 —
+# NOT the underlying providers' own direct API prices, since stt/llm/tts
+# for the entries below all route through LiveKit Inference
+# (livekit.agents.inference) and are billed at LiveKit's rate, not
+# Google's/OpenAI's/Deepgram's/Fish Audio's/Inworld's own. The one
+# exception is _ELEVENLABS_FLASH_PER_CHARACTER, which IS the direct
+# ElevenLabs rate — build_elevenlabs_tts() uses the direct plugin, not
+# Inference, so it's billed straight to the ElevenLabs account instead.
+# If you switch LiveKit Cloud plans (Build/Ship vs Scale), re-check these:
+# Inworld and Deepgram/ElevenLabs STT rates differ by plan; Gemini/GPT-5-mini
+# LLM rates and the Fish Audio TTS rate were confirmed identical on both as
+# of the same date.
 #
-# Approximate USD rates per provider/model, from each provider's public
-# pricing page as of 2026-08-09. These are ESTIMATES for internal cost
-# tracking only — always reconcile against actual provider invoices, since
-# rates change and this doesn't account for volume/commitment discounts.
-# Azure isn't priced here: its plugin doesn't report model_provider/model_name
-# metadata the way the others do, so it hasn't been confirmed against a real
-# usage entry to know the exact keys it would use (even though it's now the
-# primary TTS voice — see build_azure_tts).
+# The `provider`/`model` strings these usage entries actually contain once
+# routed through the gateway haven't all been individually confirmed against
+# a real call (see per-model notes below) — matching may still silently
+# return None for an entry if a provider string differs from what's assumed.
+# Azure isn't priced here at all: its plugin doesn't report
+# model_provider/model_name metadata the way the others do, so it hasn't
+# been confirmed against a real usage entry to know the exact keys it would
+# use (even though it's currently unused as a fallback — see build_azure_tts).
 #
 # Gemini 3.1 Flash-Lite is matched on `model` alone (no `provider` check,
 # unlike the OpenAI/ElevenLabs/Deepgram entries below) — the exact
@@ -226,16 +228,28 @@ _GEMINI_FLASH_LITE_INPUT_PER_TOKEN = 0.25 / 1_000_000
 _GEMINI_FLASH_LITE_CACHED_INPUT_PER_TOKEN = 0.025 / 1_000_000
 _GEMINI_FLASH_LITE_OUTPUT_PER_TOKEN = 1.50 / 1_000_000  # includes thinking tokens
 _GPT5_MINI_INPUT_PER_TOKEN = 0.25 / 1_000_000
-_GPT5_MINI_CACHED_INPUT_PER_TOKEN = 0.025 / 1_000_000
+_GPT5_MINI_CACHED_INPUT_PER_TOKEN = 0.030 / 1_000_000
 _GPT5_MINI_OUTPUT_PER_TOKEN = 2.00 / 1_000_000
+# Direct ElevenLabs API rate (not Inference — see note above), from
+# elevenlabs.io/pricing/api as of 2026-08-12: "$0.05 per 1K characters" for
+# the Flash/Turbo tier, which eleven_flash_v2_5 falls under.
 _ELEVENLABS_FLASH_PER_CHARACTER = 0.05 / 1_000
-_DEEPGRAM_NOVA3_PER_SECOND = 0.0077 / 60
-# Sourced directly from livekit.com/pricing (the actual billing rate card for
-# this one, unlike the direct-provider prices above) as of 2026-08-11: $0.0090
-# per minute of generated audio, same rate on Build/Ship and Scale plans.
-# Matched on `model` alone, same reasoning as Gemini above — the `provider`
-# string this entry reports hasn't been confirmed against a real usage entry.
-_FISHAUDIO_S21PRO_PER_MINUTE = 0.0090
+# ElevenLabs Scribe v2 Realtime (the primary STT) had no cost entry at all
+# before this — it was silently falling through to the `return None` below
+# on every call. Matched on `model` alone, same reasoning as Gemini above.
+_ELEVENLABS_SCRIBE_V2_REALTIME_PER_SECOND = 0.0105 / 60
+# Was 0.0077/min here previously — that was Deepgram's own direct nova-3
+# rate, not LiveKit's Inference rate for it, which is lower.
+_DEEPGRAM_NOVA3_PER_SECOND = 0.0048 / 60
+# Fish Audio and Inworld are both billed per character of input text, not
+# per minute of output audio — the per-minute figure on livekit.com/pricing
+# is a simplified marketing conversion; the granular rate card at
+# livekit.com/pricing/inference gives the actual metered unit as
+# $/million characters, which is what these two constants use. Matched on
+# `model` alone, same reasoning as Gemini above — the `provider` string
+# these entries report hasn't been confirmed against a real usage entry.
+_FISHAUDIO_S21PRO_PER_CHARACTER = 15.00 / 1_000_000
+_INWORLD_TTS_15_MAX_PER_CHARACTER = 35.00 / 1_000_000
 
 
 def _estimate_entry_cost(entry: dict) -> float | None:
@@ -260,10 +274,14 @@ def _estimate_entry_cost(entry: dict) -> float | None:
         )
     if provider == "ElevenLabs" and model == "eleven_flash_v2_5":
         return entry.get("characters_count", 0) * _ELEVENLABS_FLASH_PER_CHARACTER
+    if model == "elevenlabs/scribe_v2_realtime":
+        return entry.get("audio_duration", 0) * _ELEVENLABS_SCRIBE_V2_REALTIME_PER_SECOND
     if provider == "Deepgram" and model == "nova-3":
         return entry.get("audio_duration", 0) * _DEEPGRAM_NOVA3_PER_SECOND
     if model == "fishaudio/s2.1-pro":
-        return entry.get("audio_duration", 0) / 60 * _FISHAUDIO_S21PRO_PER_MINUTE
+        return entry.get("characters_count", 0) * _FISHAUDIO_S21PRO_PER_CHARACTER
+    if model == "inworld/inworld-tts-1.5-max":
+        return entry.get("characters_count", 0) * _INWORLD_TTS_15_MAX_PER_CHARACTER
     return None
 
 
