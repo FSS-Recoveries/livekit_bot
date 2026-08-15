@@ -250,6 +250,16 @@ _DEEPGRAM_NOVA3_PER_SECOND = 0.0048 / 60
 # these entries report hasn't been confirmed against a real usage entry.
 _FISHAUDIO_S21PRO_PER_CHARACTER = 15.00 / 1_000_000
 _INWORLD_TTS_15_MAX_PER_CHARACTER = 35.00 / 1_000_000
+# AssemblyAI Universal-Streaming-Multilingual (third STT fallback): $0.0025/min,
+# the cheapest STT on LiveKit's Inference rate card. Matched on `model`
+# alone, same reasoning as Gemini above.
+_ASSEMBLYAI_UNIVERSAL_STREAMING_MULTILINGUAL_PER_SECOND = 0.0025 / 60
+# xAI Grok 4.1 Fast non-reasoning (third LLM fallback): $0.20/$0.50 per
+# million input/output tokens. LiveKit's rate card lists no separate cached-
+# input rate for this model (shown as N/A) — all input tokens are billed at
+# the same rate, unlike the Gemini/GPT-5-mini entries above.
+_GROK_4_1_FAST_INPUT_PER_TOKEN = 0.20 / 1_000_000
+_GROK_4_1_FAST_OUTPUT_PER_TOKEN = 0.50 / 1_000_000
 
 
 def _estimate_entry_cost(entry: dict) -> float | None:
@@ -282,6 +292,13 @@ def _estimate_entry_cost(entry: dict) -> float | None:
         return entry.get("characters_count", 0) * _FISHAUDIO_S21PRO_PER_CHARACTER
     if model == "inworld/inworld-tts-1.5-max":
         return entry.get("characters_count", 0) * _INWORLD_TTS_15_MAX_PER_CHARACTER
+    if model == "assemblyai/universal-streaming-multilingual":
+        return entry.get("audio_duration", 0) * _ASSEMBLYAI_UNIVERSAL_STREAMING_MULTILINGUAL_PER_SECOND
+    if model == "xai/grok-4-1-fast-non-reasoning":
+        return (
+            entry.get("input_tokens", 0) * _GROK_4_1_FAST_INPUT_PER_TOKEN
+            + entry.get("output_tokens", 0) * _GROK_4_1_FAST_OUTPUT_PER_TOKEN
+        )
     return None
 
 
@@ -773,14 +790,21 @@ async def entrypoint(ctx: JobContext):
     # plugins instead of Inference, so AZURE_SPEECH_KEY, AZURE_SPEECH_REGION,
     # and ELEVENLABS_API_KEY are still required for that component.
     #
-    # STT: ElevenLabs Scribe v2 Realtime as primary, Deepgram as fallback if
-    # ElevenLabs errors out mid-call.
+    # STT: Deepgram Nova-3 primary, ElevenLabs Scribe v2 Realtime as first
+    # fallback, AssemblyAI Universal-Streaming-Multilingual as third.
+    # Deepgram Nova-3 primary for lowest latency: published benchmarks put
+    # its median time-to-first-speech at ~98ms vs AssemblyAI's ~123ms, and
+    # time-to-final around ~450ms vs ~760ms — a real gap for a live call,
+    # not a rounding difference. Trade-off: AssemblyAI reportedly has the
+    # lower word-error-rate of the two, so it stays as a cheap fallback
+    # ($0.0025/min, the lowest on LiveKit's STT rate card) rather than being
+    # dropped — if Deepgram errors out mid-call, still-decent accuracy at
+    # minimal cost, just not the fastest option.
     stt = agents_stt.FallbackAdapter(
         [
-            
             inference.STT("deepgram/nova-3", language="en"),
+            inference.STT("assemblyai/universal-streaming-multilingual", language="en"),
             inference.STT("elevenlabs/scribe_v2_realtime", language="en"),
-            #inference.STT("elevenlabs/scribe_v2_realtime"),
         ]
     )
     # LLM: Gemini 3.1 Flash-Lite as primary, gpt-5-mini as fallback if
@@ -795,10 +819,23 @@ async def entrypoint(ctx: JobContext):
     #
     # gpt-5-mini: not passing temperature — GPT-5-series models reject a
     # custom value (400 error unless left at the API default of 1).
+    #
+    # xai/grok-4-1-fast-non-reasoning as third fallback: cheapest credible
+    # option on the whole Inference LLM rate card ($0.20/$0.50 in/out per
+    # million tokens — below both Gemini Flash-Lite and gpt-5-mini, and a
+    # fraction of gpt-5-mini's $2.00 output rate), and a third distinct
+    # provider family (neither Google nor OpenAI) so a Gemini- or
+    # OpenAI-wide outage doesn't take out two of the three at once. The
+    # "non-reasoning" variant specifically, not "-reasoning": same price on
+    # LiveKit's rate card, but reasoning mode spends extra tokens on
+    # internal chain-of-thought before answering, which only adds latency
+    # here — this prompt needs reliable instruction-following and tool
+    # calls, not multi-step reasoning.
     llm = agents_llm.FallbackAdapter(
         [
             inference.LLM("google/gemini-3.1-flash-lite"),
             inference.LLM("openai/gpt-5-mini"),
+            inference.LLM("xai/grok-4-1-fast-non-reasoning"),
         ]
     )
     # Silero VAD runs locally, not through any external provider — it never
