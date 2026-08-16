@@ -748,29 +748,6 @@ async def entrypoint(ctx: JobContext):
     opening_stall_task: asyncio.Task | None = None
     hmm_filler_task: asyncio.Task | None = None
     silence_shutdown_task: asyncio.Task | None = None
-    customer_delay_hmm_task: asyncio.Task | None = None
-    # Declared here (early) rather than down in the "Silence safety net"
-    # section where it's actually used: the bot's first proactive reply can
-    # start playing while entrypoint() is still awaiting inside the AMD
-    # block (authorization is resumed eagerly once AMD's verdict is ready,
-    # before execute() itself returns), which fires agent_state_changed
-    # before the code below this point has run. _speak_hmm_for_customer_delay
-    # reads this variable, so it must already exist by then, not just by
-    # the time _on_user_state_changed's own definition is reached.
-    checked_in = False
-    # At-most-once-per-gap guards for the two Hmm fillers — see
-    # _on_conversation_item_added for why these reset there rather than on
-    # agent_state_changed "speaking": saying "Hmm?" is itself agent speech,
-    # so agent_state_changed can't tell a real reply apart from the filler
-    # that just fired. Critically, this also isn't just about avoiding
-    # back-to-back "Hmm?"s — AgentSession's own away-timer only (re)arms
-    # when agent and user are BOTH "listening" at the same instant, and
-    # cancels on any agent speech. A filler that keeps re-arming itself
-    # therefore never lets that timer accumulate a clean run, so "Are you
-    # still with me?" (and the hangup after it) would never fire at all
-    # for a genuinely silent caller.
-    hmm_used_for_current_thinking = False
-    customer_delay_hmm_used = False
 
     async def _on_shutdown():
         # ctx.shutdown() (used everywhere we decide to end the call) only
@@ -796,8 +773,6 @@ async def entrypoint(ctx: JobContext):
             hmm_filler_task.cancel()
         if silence_shutdown_task is not None:
             silence_shutdown_task.cancel()
-        if customer_delay_hmm_task is not None:
-            customer_delay_hmm_task.cancel()
 
         egress_info = await egress_task
         recording_url = await _finish_call_recording(ctx, egress_info)
@@ -1007,8 +982,7 @@ async def entrypoint(ctx: JobContext):
         ctx.shutdown(reason="hearing-difficulty backstop: repeated greeting-only exchanges")
 
     def _on_conversation_item_added(ev):
-        nonlocal hmm_filler_task, customer_delay_hmm_task, consecutive_greeting_only_turns
-        nonlocal hmm_used_for_current_thinking, customer_delay_hmm_used
+        nonlocal hmm_filler_task, consecutive_greeting_only_turns
         item = ev.item
         role = getattr(item, "role", None)
         text = getattr(item, "text_content", None)
@@ -1020,23 +994,8 @@ async def entrypoint(ctx: JobContext):
         # generation can bounce agent_state between "thinking" and
         # "speaking" mid-turn, occasionally leaving a stale filler timer
         # armed that then fires right after real content was just spoken.
-        # This event only fires for real content (both fillers are said
-        # with add_to_chat_ctx=False), so it's also the correct place to
-        # reset the at-most-once-per-gap flag for the next real turn —
-        # agent_state_changed can't do this itself, since the filler
-        # speaking is indistinguishable from a real reply speaking at that
-        # level.
-        if role == "assistant":
-            hmm_used_for_current_thinking = False
-            if hmm_filler_task is not None and not hmm_filler_task.done():
-                hmm_filler_task.cancel()
-        # Same belt-and-suspenders, other direction: a real user utterance
-        # just landed, so the customer-delay "Hmm?" is moot even if the
-        # user_state_changed "speaking" transition was missed or delayed.
-        if role == "user":
-            customer_delay_hmm_used = False
-            if customer_delay_hmm_task is not None and not customer_delay_hmm_task.done():
-                customer_delay_hmm_task.cancel()
+        if role == "assistant" and hmm_filler_task is not None and not hmm_filler_task.done():
+            hmm_filler_task.cancel()
         if role == "user" and text:
             if _is_greeting_only_utterance(text):
                 consecutive_greeting_only_turns += 1
@@ -1072,63 +1031,15 @@ async def entrypoint(ctx: JobContext):
         await _play_wav_greeting(ctx.room, GREETING_V2_WAV_PATH)
 
     async def _speak_hmm_after_delay() -> None:
-        nonlocal hmm_used_for_current_thinking
         await asyncio.sleep(HMM_FILLER_DELAY_SECONDS)
-        # Guard against firing into a call that's already wrapping up: the
-        # framework's own shutdown sequence (session.aclose() -> room
-        # disconnect -> our _on_shutdown callback, which is what actually
-        # cancels this task) isn't instantaneous, so there's a real window
-        # right after ctx.shutdown() is called where this task could still
-        # be pending. Same defensive check _enforce_max_call_duration
-        # already uses.
-        if ctx.room.connection_state != rtc.ConnectionState.CONN_CONNECTED:
-            return
-        # Marked used *before* speaking, and not reset until a real
-        # assistant reply lands (_on_conversation_item_added) — never fires
-        # twice for the same thinking episode, however long it runs.
-        hmm_used_for_current_thinking = True
         # add_to_chat_ctx=False: this is a stalling interjection, not real
         # dialogue — it must never enter the LLM's own conversation history,
         # and if TTS happens to be down when this fires, it must not leave a
         # phantom "assistant said this" line in the transcript either.
         session.say("Hmm?", allow_interruptions=True, add_to_chat_ctx=False)
 
-    async def _speak_hmm_for_customer_delay() -> None:
-        # Mirror of the bot-delay filler above, for the other direction:
-        # Mary just finished speaking and the customer hasn't started
-        # responding yet. Same delay, same fire-once-per-episode shape,
-        # same reason for add_to_chat_ctx=False.
-        nonlocal customer_delay_hmm_used
-        await asyncio.sleep(HMM_FILLER_DELAY_SECONDS)
-        if ctx.room.connection_state != rtc.ConnectionState.CONN_CONNECTED:
-            return
-        # Don't step on the silence safety net: once "Are you still with
-        # me?" has been said (checked_in), every subsequent agent
-        # utterance — that line itself, and any closing line if the call
-        # is about to end — would otherwise re-arm this same task (Mary
-        # speaking, however briefly, always looks like "just stopped
-        # speaking, waiting on the customer" to _on_agent_state_changed
-        # below). That produced a real bug: a "Hmm?" firing after "Are you
-        # still with me?", and again after any closing line, right up
-        # until _on_shutdown finally cancels it. Once checked_in is set,
-        # this filler goes fully quiet and leaves silence handling entirely
-        # to that mechanism.
-        if checked_in:
-            return
-        # Marked used *before* speaking, and not reset until a real user
-        # utterance lands (_on_conversation_item_added) — critically, this
-        # also means this task's own agent_state transitions (speaking,
-        # then back to listening once "Hmm?" finishes) can no longer
-        # re-arm itself. Without this, the filler would keep resetting
-        # AgentSession's away-timer (it only (re)arms when agent and user
-        # are both "listening" with nothing happening) every time it fired,
-        # so a genuinely silent caller would hear "Hmm?" forever and never
-        # reach "Are you still with me?" or the hangup after it.
-        customer_delay_hmm_used = True
-        session.say("Hmm?", allow_interruptions=True, add_to_chat_ctx=False)
-
     def _on_agent_state_changed(ev) -> None:
-        nonlocal first_response_delivered, opening_stall_task, hmm_filler_task, customer_delay_hmm_task
+        nonlocal first_response_delivered, opening_stall_task, hmm_filler_task
         if ev.new_state == "speaking":
             if not first_response_delivered:
                 first_response_delivered = True
@@ -1136,33 +1047,12 @@ async def entrypoint(ctx: JobContext):
                     opening_stall_task.cancel()
             if hmm_filler_task is not None and not hmm_filler_task.done():
                 hmm_filler_task.cancel()
-            if customer_delay_hmm_task is not None and not customer_delay_hmm_task.done():
-                customer_delay_hmm_task.cancel()
             return
         if ev.new_state == "thinking":
-            if not hmm_used_for_current_thinking and (
-                hmm_filler_task is None or hmm_filler_task.done()
-            ):
+            if hmm_filler_task is None or hmm_filler_task.done():
                 hmm_filler_task = asyncio.create_task(_speak_hmm_after_delay())
-            if customer_delay_hmm_task is not None and not customer_delay_hmm_task.done():
-                customer_delay_hmm_task.cancel()
-            return
-        if hmm_filler_task is not None and not hmm_filler_task.done():
+        elif hmm_filler_task is not None and not hmm_filler_task.done():
             hmm_filler_task.cancel()
-        # Mary just stopped speaking (old_state == "speaking") without
-        # immediately thinking/speaking again — we're now waiting on the
-        # customer. Arm the same delay on this side too, cancelled the
-        # instant they actually start talking (see _on_user_state_changed)
-        # or Mary speaks/thinks again (handled by the two branches above).
-        # not customer_delay_hmm_used is what stops this from re-arming
-        # itself off of its own "Hmm?" — see that function for why that
-        # matters beyond just avoiding back-to-back fillers.
-        if (
-            ev.old_state == "speaking"
-            and not customer_delay_hmm_used
-            and (customer_delay_hmm_task is None or customer_delay_hmm_task.done())
-        ):
-            customer_delay_hmm_task = asyncio.create_task(_speak_hmm_for_customer_delay())
 
     session.on("agent_state_changed", _on_agent_state_changed)
 
@@ -1367,18 +1257,14 @@ async def entrypoint(ctx: JobContext):
     # unpredictable either way. So instead: on the first "away", start our
     # own plain timer: if the caller hasn't spoken by the time it fires,
     # hang up, regardless of what the framework's own state does next.
-    # (checked_in itself is declared earlier — see the comment up there.)
+    checked_in = False
 
     def _on_user_state_changed(ev):
-        nonlocal checked_in, silence_shutdown_task, customer_delay_hmm_task
+        nonlocal checked_in, silence_shutdown_task
         if ev.new_state != "away":
             checked_in = False
             if silence_shutdown_task is not None and not silence_shutdown_task.done():
                 silence_shutdown_task.cancel()
-            # Customer actually started responding — the customer-delay
-            # "Hmm?" (see _on_agent_state_changed) is now moot.
-            if ev.new_state == "speaking" and customer_delay_hmm_task is not None and not customer_delay_hmm_task.done():
-                customer_delay_hmm_task.cancel()
             return
         if not checked_in:
             checked_in = True
