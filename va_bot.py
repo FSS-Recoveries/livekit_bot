@@ -748,6 +748,7 @@ async def entrypoint(ctx: JobContext):
     opening_stall_task: asyncio.Task | None = None
     hmm_filler_task: asyncio.Task | None = None
     silence_shutdown_task: asyncio.Task | None = None
+    customer_delay_hmm_task: asyncio.Task | None = None
 
     async def _on_shutdown():
         # ctx.shutdown() (used everywhere we decide to end the call) only
@@ -773,6 +774,8 @@ async def entrypoint(ctx: JobContext):
             hmm_filler_task.cancel()
         if silence_shutdown_task is not None:
             silence_shutdown_task.cancel()
+        if customer_delay_hmm_task is not None:
+            customer_delay_hmm_task.cancel()
 
         egress_info = await egress_task
         recording_url = await _finish_call_recording(ctx, egress_info)
@@ -982,7 +985,7 @@ async def entrypoint(ctx: JobContext):
         ctx.shutdown(reason="hearing-difficulty backstop: repeated greeting-only exchanges")
 
     def _on_conversation_item_added(ev):
-        nonlocal hmm_filler_task, consecutive_greeting_only_turns
+        nonlocal hmm_filler_task, customer_delay_hmm_task, consecutive_greeting_only_turns
         item = ev.item
         role = getattr(item, "role", None)
         text = getattr(item, "text_content", None)
@@ -996,6 +999,11 @@ async def entrypoint(ctx: JobContext):
         # armed that then fires right after real content was just spoken.
         if role == "assistant" and hmm_filler_task is not None and not hmm_filler_task.done():
             hmm_filler_task.cancel()
+        # Same belt-and-suspenders, other direction: a real user utterance
+        # just landed, so the customer-delay "Hmm?" is moot even if the
+        # user_state_changed "speaking" transition was missed or delayed.
+        if role == "user" and customer_delay_hmm_task is not None and not customer_delay_hmm_task.done():
+            customer_delay_hmm_task.cancel()
         if role == "user" and text:
             if _is_greeting_only_utterance(text):
                 consecutive_greeting_only_turns += 1
@@ -1038,8 +1046,16 @@ async def entrypoint(ctx: JobContext):
         # phantom "assistant said this" line in the transcript either.
         session.say("Hmm?", allow_interruptions=True, add_to_chat_ctx=False)
 
+    async def _speak_hmm_for_customer_delay() -> None:
+        # Mirror of the bot-delay filler above, for the other direction:
+        # Mary just finished speaking and the customer hasn't started
+        # responding yet. Same delay, same fire-once-per-episode shape,
+        # same reason for add_to_chat_ctx=False.
+        await asyncio.sleep(HMM_FILLER_DELAY_SECONDS)
+        session.say("Hmm?", allow_interruptions=True, add_to_chat_ctx=False)
+
     def _on_agent_state_changed(ev) -> None:
-        nonlocal first_response_delivered, opening_stall_task, hmm_filler_task
+        nonlocal first_response_delivered, opening_stall_task, hmm_filler_task, customer_delay_hmm_task
         if ev.new_state == "speaking":
             if not first_response_delivered:
                 first_response_delivered = True
@@ -1047,12 +1063,26 @@ async def entrypoint(ctx: JobContext):
                     opening_stall_task.cancel()
             if hmm_filler_task is not None and not hmm_filler_task.done():
                 hmm_filler_task.cancel()
+            if customer_delay_hmm_task is not None and not customer_delay_hmm_task.done():
+                customer_delay_hmm_task.cancel()
             return
         if ev.new_state == "thinking":
             if hmm_filler_task is None or hmm_filler_task.done():
                 hmm_filler_task = asyncio.create_task(_speak_hmm_after_delay())
-        elif hmm_filler_task is not None and not hmm_filler_task.done():
+            if customer_delay_hmm_task is not None and not customer_delay_hmm_task.done():
+                customer_delay_hmm_task.cancel()
+            return
+        if hmm_filler_task is not None and not hmm_filler_task.done():
             hmm_filler_task.cancel()
+        # Mary just stopped speaking (old_state == "speaking") without
+        # immediately thinking/speaking again — we're now waiting on the
+        # customer. Arm the same delay on this side too, cancelled the
+        # instant they actually start talking (see _on_user_state_changed)
+        # or Mary speaks/thinks again (handled by the two branches above).
+        if ev.old_state == "speaking" and (
+            customer_delay_hmm_task is None or customer_delay_hmm_task.done()
+        ):
+            customer_delay_hmm_task = asyncio.create_task(_speak_hmm_for_customer_delay())
 
     session.on("agent_state_changed", _on_agent_state_changed)
 
@@ -1260,11 +1290,15 @@ async def entrypoint(ctx: JobContext):
     checked_in = False
 
     def _on_user_state_changed(ev):
-        nonlocal checked_in, silence_shutdown_task
+        nonlocal checked_in, silence_shutdown_task, customer_delay_hmm_task
         if ev.new_state != "away":
             checked_in = False
             if silence_shutdown_task is not None and not silence_shutdown_task.done():
                 silence_shutdown_task.cancel()
+            # Customer actually started responding — the customer-delay
+            # "Hmm?" (see _on_agent_state_changed) is now moot.
+            if ev.new_state == "speaking" and customer_delay_hmm_task is not None and not customer_delay_hmm_task.done():
+                customer_delay_hmm_task.cancel()
             return
         if not checked_in:
             checked_in = True
