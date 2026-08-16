@@ -7,3 +7,4 @@ __pycache__/
 service_account.json
 *service-account*.json
 *serviceAccount*.json
+*.log

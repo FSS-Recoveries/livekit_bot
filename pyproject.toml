@@ -7,6 +7,7 @@ dependencies = [
     "aiohttp>=3.11.0",
     "azure-cognitiveservices-speech>=1.51.1",
     "firebase-admin>=7.5.0",
+    "google-cloud-bigquery>=3.43.0",
     "livekit==1.1.13",
     "livekit-agents==1.6.7",
     "livekit-api==1.2.0",
