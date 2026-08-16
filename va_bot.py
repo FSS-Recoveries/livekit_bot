@@ -749,6 +749,15 @@ async def entrypoint(ctx: JobContext):
     hmm_filler_task: asyncio.Task | None = None
     silence_shutdown_task: asyncio.Task | None = None
     customer_delay_hmm_task: asyncio.Task | None = None
+    # Declared here (early) rather than down in the "Silence safety net"
+    # section where it's actually used: the bot's first proactive reply can
+    # start playing while entrypoint() is still awaiting inside the AMD
+    # block (authorization is resumed eagerly once AMD's verdict is ready,
+    # before execute() itself returns), which fires agent_state_changed
+    # before the code below this point has run. _speak_hmm_for_customer_delay
+    # reads this variable, so it must already exist by then, not just by
+    # the time _on_user_state_changed's own definition is reached.
+    checked_in = False
 
     async def _on_shutdown():
         # ctx.shutdown() (used everywhere we decide to end the call) only
@@ -1040,6 +1049,15 @@ async def entrypoint(ctx: JobContext):
 
     async def _speak_hmm_after_delay() -> None:
         await asyncio.sleep(HMM_FILLER_DELAY_SECONDS)
+        # Guard against firing into a call that's already wrapping up: the
+        # framework's own shutdown sequence (session.aclose() -> room
+        # disconnect -> our _on_shutdown callback, which is what actually
+        # cancels this task) isn't instantaneous, so there's a real window
+        # right after ctx.shutdown() is called where this task could still
+        # be pending. Same defensive check _enforce_max_call_duration
+        # already uses.
+        if ctx.room.connection_state != rtc.ConnectionState.CONN_CONNECTED:
+            return
         # add_to_chat_ctx=False: this is a stalling interjection, not real
         # dialogue — it must never enter the LLM's own conversation history,
         # and if TTS happens to be down when this fires, it must not leave a
@@ -1052,6 +1070,21 @@ async def entrypoint(ctx: JobContext):
         # responding yet. Same delay, same fire-once-per-episode shape,
         # same reason for add_to_chat_ctx=False.
         await asyncio.sleep(HMM_FILLER_DELAY_SECONDS)
+        if ctx.room.connection_state != rtc.ConnectionState.CONN_CONNECTED:
+            return
+        # Don't step on the silence safety net: once "Are you still with
+        # me?" has been said (checked_in), every subsequent agent
+        # utterance — that line itself, and any closing line if the call
+        # is about to end — would otherwise re-arm this same task (Mary
+        # speaking, however briefly, always looks like "just stopped
+        # speaking, waiting on the customer" to _on_agent_state_changed
+        # below). That produced a real bug: a "Hmm?" firing after "Are you
+        # still with me?", and again after any closing line, right up
+        # until _on_shutdown finally cancels it. Once checked_in is set,
+        # this filler goes fully quiet and leaves silence handling entirely
+        # to that mechanism.
+        if checked_in:
+            return
         session.say("Hmm?", allow_interruptions=True, add_to_chat_ctx=False)
 
     def _on_agent_state_changed(ev) -> None:
@@ -1287,7 +1320,7 @@ async def entrypoint(ctx: JobContext):
     # unpredictable either way. So instead: on the first "away", start our
     # own plain timer: if the caller hasn't spoken by the time it fires,
     # hang up, regardless of what the framework's own state does next.
-    checked_in = False
+    # (checked_in itself is declared earlier — see the comment up there.)
 
     def _on_user_state_changed(ev):
         nonlocal checked_in, silence_shutdown_task, customer_delay_hmm_task
