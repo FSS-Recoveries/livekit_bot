@@ -679,7 +679,7 @@ OPENING_STALL_DELAY_SECONDS = 3
 HMM_FILLER_DELAY_SECONDS = 3
 # How long to wait after the "Are you still with me?" check-in before
 # giving up and hanging up, if the caller still hasn't responded.
-SILENCE_SHUTDOWN_DELAY_SECONDS = 10
+SILENCE_SHUTDOWN_DELAY_SECONDS = 6
 
 
 async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
