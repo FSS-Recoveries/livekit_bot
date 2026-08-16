@@ -954,7 +954,7 @@ async def entrypoint(ctx: JobContext):
         # below (_on_user_state_changed) fires "Are you still with me?".
         # Framework default is 15s; shortened so a genuinely dead line gets
         # caught and closed out faster.
-        user_away_timeout=6.0,
+        user_away_timeout=3.0,
     )
 
     # session.emit("metrics_collected", MetricsCollectedEvent(metrics=...)) wraps
