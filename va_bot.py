@@ -679,7 +679,7 @@ OPENING_STALL_DELAY_SECONDS = 3
 HMM_FILLER_DELAY_SECONDS = 3
 # How long to wait after the "Are you still with me?" check-in before
 # giving up and hanging up, if the caller still hasn't responded.
-SILENCE_SHUTDOWN_DELAY_SECONDS = 6
+SILENCE_SHUTDOWN_DELAY_SECONDS = 12
 
 
 async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
@@ -954,7 +954,7 @@ async def entrypoint(ctx: JobContext):
         # below (_on_user_state_changed) fires "Are you still with me?".
         # Framework default is 15s; shortened so a genuinely dead line gets
         # caught and closed out faster.
-        user_away_timeout=3.0,
+        user_away_timeout=6.0,
     )
 
     # session.emit("metrics_collected", MetricsCollectedEvent(metrics=...)) wraps
