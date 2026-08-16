@@ -950,6 +950,11 @@ async def entrypoint(ctx: JobContext):
         # finish rather than being lost. "Hold on" / "Wait, stop" (2+
         # words) still interrupt immediately.
         min_interruption_words=2,
+        # How long the customer can go quiet before the silence safety net
+        # below (_on_user_state_changed) fires "Are you still with me?".
+        # Framework default is 15s; shortened so a genuinely dead line gets
+        # caught and closed out faster.
+        user_away_timeout=6.0,
     )
 
     # session.emit("metrics_collected", MetricsCollectedEvent(metrics=...)) wraps
@@ -1239,8 +1244,8 @@ async def entrypoint(ctx: JobContext):
             pass
 
     # Silence safety net: the LLM only reacts to turns, so if the customer
-    # goes quiet it can't act on its own. After user_away_timeout (15s
-    # default) of no user activity, check in once.
+    # goes quiet it can't act on its own. After user_away_timeout (6s, set
+    # explicitly above) of no user activity, check in once.
     #
     # This does NOT wait for a second "away" event to decide whether to hang
     # up — the framework's away-timer is one-shot and only re-arms when the
