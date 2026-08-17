@@ -1083,6 +1083,80 @@ async def entrypoint(ctx: JobContext):
 
     session.on("agent_state_changed", _on_agent_state_changed)
 
+    # Silence safety net: the LLM only reacts to turns, so if the customer
+    # goes quiet it can't act on its own. After user_away_timeout (6s, set
+    # above) of no user activity, check in once, then hang up if nothing
+    # follows.
+    #
+    # Registered here — before session.start()/the greeting/AMD — rather
+    # than after them (as this used to be): AgentSession arms its away-timer
+    # as soon as the session starts, so a listener only attached after the
+    # ~10s AMD window could miss the very first "away" transition entirely.
+    # That transition doesn't reliably repeat on its own (AgentSession only
+    # re-arms the timer when the agent and user both transition INTO
+    # "listening" at the same moment), so a missed one used to mean no
+    # safety net at all until some unrelated event happened to re-arm it —
+    # which is exactly what let one real call sit in ~4 minutes of dead air
+    # before this ever fired. AMD only pauses the agent's own auto-reply
+    # authorization (AgentActivity._pause_authorization), not user-state
+    # tracking, so this stays live and correct straight through the
+    # greeting/AMD window too — session.say() below simply queues until AMD
+    # releases that lock if this fires mid-detection.
+    checked_in = False
+
+    def _cancel_pending_silence_shutdown() -> None:
+        nonlocal checked_in, silence_shutdown_task
+        checked_in = False
+        if silence_shutdown_task is not None and not silence_shutdown_task.done():
+            silence_shutdown_task.cancel()
+
+    def _on_user_state_changed(ev):
+        nonlocal checked_in, silence_shutdown_task
+        if ev.new_state == "speaking":
+            # Unambiguous real speech (VAD-confirmed, not just a stray final
+            # transcript) — safe to cancel here directly rather than waiting
+            # on _on_user_input_transcribed, which can lag several seconds
+            # behind the STT provider (e.g. mid-fallover on the STT
+            # FallbackAdapter).
+            _cancel_pending_silence_shutdown()
+            return
+        if ev.new_state != "away":
+            # A bare away→listening transition isn't itself trustworthy: per
+            # AgentSession._user_input_transcribed, ANY final transcript —
+            # including an empty one from a stray noise/VAD-miss blip — resets
+            # away straight back to listening, with no content check. Don't
+            # cancel our own countdown on that alone; wait for
+            # _on_user_input_transcribed below to confirm real content
+            # actually came through.
+            return
+        if not checked_in:
+            checked_in = True
+            # session.say() returns a SpeechHandle (already queued/running,
+            # not a coroutine) — wrapping it in asyncio.create_task() raises
+            # TypeError, so it's called directly, fire-and-forget.
+            session.say("Are you still with me?", allow_interruptions=True)
+            silence_shutdown_task = asyncio.create_task(_shutdown_after_silence())
+
+    async def _shutdown_after_silence() -> None:
+        await asyncio.sleep(SILENCE_SHUTDOWN_DELAY_SECONDS)
+        ctx.shutdown(reason="no response after silence check")
+
+    def _on_user_input_transcribed(ev) -> None:
+        # A real call showed the bot repeating "Are you still with me?"
+        # three times over ~5 minutes without ever hanging up: background
+        # line noise kept producing stray *final* transcripts (sometimes
+        # empty strings), each of which resets the framework's away state to
+        # "listening" unconditionally (see note above) — and, previously,
+        # cancelled our hang-up countdown right along with it, so the
+        # countdown never once ran to completion. Only a final transcript
+        # with actual non-blank content counts as evidence the caller is
+        # really there.
+        if ev.is_final and ev.transcript.strip():
+            _cancel_pending_silence_shutdown()
+
+    session.on("user_state_changed", _on_user_state_changed)
+    session.on("user_input_transcribed", _on_user_input_transcribed)
+
     # Build the initial instructions synchronously — no blocking wait on the
     # customer lookup here. This previously did `await asyncio.wait_for(
     # lookup_task, timeout=3)` before creating the Agent, which added a fixed
@@ -1269,43 +1343,6 @@ async def entrypoint(ctx: JobContext):
             # opening_stall_task/GREETING_V2_WAV_PATH is the only thing
             # that covers the silence until they do.
             pass
-
-    # Silence safety net: the LLM only reacts to turns, so if the customer
-    # goes quiet it can't act on its own. After user_away_timeout (6s, set
-    # explicitly above) of no user activity, check in once.
-    #
-    # This does NOT wait for a second "away" event to decide whether to hang
-    # up — the framework's away-timer is one-shot and only re-arms when the
-    # agent and user both transition INTO "listening" at the same moment.
-    # Once state is "away", nothing routine flips it back: under genuine
-    # silence it just sticks, so a second "away" event may never arrive at
-    # all; on a noisy line, a stray STT final-transcript resets away→listening
-    # as a VAD-miss safety net, which can accidentally re-arm the timer —
-    # unpredictable either way. So instead: on the first "away", start our
-    # own plain timer: if the caller hasn't spoken by the time it fires,
-    # hang up, regardless of what the framework's own state does next.
-    checked_in = False
-
-    def _on_user_state_changed(ev):
-        nonlocal checked_in, silence_shutdown_task
-        if ev.new_state != "away":
-            checked_in = False
-            if silence_shutdown_task is not None and not silence_shutdown_task.done():
-                silence_shutdown_task.cancel()
-            return
-        if not checked_in:
-            checked_in = True
-            # session.say() returns a SpeechHandle (already queued/running,
-            # not a coroutine) — wrapping it in asyncio.create_task() raises
-            # TypeError, so it's called directly, fire-and-forget.
-            session.say("Are you still with me?", allow_interruptions=True)
-            silence_shutdown_task = asyncio.create_task(_shutdown_after_silence())
-
-    async def _shutdown_after_silence() -> None:
-        await asyncio.sleep(SILENCE_SHUTDOWN_DELAY_SECONDS)
-        ctx.shutdown(reason="no response after silence check")
-
-    session.on("user_state_changed", _on_user_state_changed)
 
     # No keep-alive loop here on purpose. The call's actual lifetime is
     # governed by the job's internal shutdown future (set by ctx.shutdown()
