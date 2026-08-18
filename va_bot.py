@@ -346,6 +346,12 @@ def _save_call_record(
                 "usage": usage,
                 "total_estimated_cost_usd": total_estimated_cost_usd,
                 "ended_at": fb_firestore.SERVER_TIMESTAMP,
+                # Picked up by the separate livekit_pipeline.py batch script
+                # (AI extraction, institution lookup, call_notes upserts,
+                # email alerts). False here, flipped to True once processed —
+                # explicit so the pipeline can query for it directly (Firestore
+                # can't cleanly query "field is missing").
+                "pipeline_processed": False,
             }
         )
     except Exception as e:
