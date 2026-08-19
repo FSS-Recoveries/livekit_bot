@@ -485,18 +485,18 @@ _LAGOS_TZ = ZoneInfo("Africa/Lagos")
 
 @function_tool(
     description=(
-        "Get the current date and time in Nigeria (Africa/Lagos, West Africa Time), "
-        "plus the two standard payment deadline dates used throughout the offer "
-        "ladder and discount lock-in ('the 7-day deadline' and 'the 30-day "
-        "deadline' — 7 and 30 calendar days from this call, not the end of the "
-        "current week or calendar month). Call this once near the start of every "
-        "call, and again any time you need to reason about a relative date — "
-        "converting something the customer says ('this Friday', 'tomorrow') into "
-        "an exact calendar date, or checking whether an existing ptp_date has "
-        "already passed. Never guess, assume, do your own date arithmetic, or rely "
-        "on your training data for today's date or these deadlines — always call "
-        "this instead, and always speak the actual returned dates to the customer, "
-        "never the '7 days'/'30 days' reasoning behind them."
+        "Re-check the current date and time in Nigeria (Africa/Lagos, West "
+        "Africa Time), plus the two standard payment deadline dates ('the 7-day "
+        "deadline' and 'the 30-day deadline'). Your instructions already give "
+        "you today's date and both deadline dates at the start of this call — "
+        "treat those as authoritative and do not call this tool to re-derive "
+        "them. Only call this if the customer disputes today's date, the call "
+        "has been running for an unusually long time, or you need to convert "
+        "something the customer says ('this Friday', 'tomorrow') into an exact "
+        "calendar date. Never guess, assume, do your own date arithmetic, or "
+        "rely on your training data for today's date — call this instead, and "
+        "always speak the actual returned dates, never the '7 days'/'30 days' "
+        "reasoning behind them."
     )
 )
 async def get_current_datetime(ctx: RunContext) -> str:
@@ -685,7 +685,7 @@ OPENING_STALL_DELAY_SECONDS = 3
 HMM_FILLER_DELAY_SECONDS = 3
 # How long to wait after the "Are you still with me?" check-in before
 # giving up and hanging up, if the caller still hasn't responded.
-SILENCE_SHUTDOWN_DELAY_SECONDS = 10
+SILENCE_SHUTDOWN_DELAY_SECONDS = 12
 
 
 async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
@@ -822,6 +822,33 @@ async def entrypoint(ctx: JobContext):
     except FileNotFoundError:
         system_prompt = "You are Mary, a debt collection assistant."
 
+    # Ground the model in the real current date via code, not tool-call
+    # discipline. Previously the model was relying on get_current_datetime
+    # being called (and remembered correctly) throughout a long negotiation,
+    # and was observed instead doing its own date arithmetic mid-call and
+    # confidently stating a wrong year for the 7-day/30-day deadlines. Baking
+    # the actual dates into the instructions means they're present in every
+    # single turn's context for the rest of the call — nothing to recall,
+    # nothing to compute, nothing to get wrong. get_current_datetime still
+    # exists as a fallback for edge cases (the customer disputes today's
+    # date, or the call runs unusually long).
+    _call_start_dt = datetime.now(_LAGOS_TZ)
+    _seven_day_deadline_dt = _call_start_dt + timedelta(days=7)
+    _thirty_day_deadline_dt = _call_start_dt + timedelta(days=30)
+    system_prompt += (
+        f"\n\nCURRENT DATE CONTEXT (authoritative for this entire call — never "
+        f"override with your own sense of today's date, and never do your own "
+        f"date arithmetic): today is "
+        f"{_call_start_dt.strftime('%A, %B %d, %Y')}. The 7-day payment "
+        f"deadline is {_seven_day_deadline_dt.strftime('%A, %B %d, %Y')}. The "
+        f"30-day payment deadline is "
+        f"{_thirty_day_deadline_dt.strftime('%A, %B %d, %Y')}. These are fixed "
+        f"for the rest of this call — speak them exactly as given here, never "
+        f"as 'in 7 days', 'this week', 'in 30 days', or 'end of month'. Only "
+        f"call get_current_datetime if the customer disputes today's date or "
+        f"the call has been running for a long time."
+    )
+
     # Providers — STT and LLM via LiveKit Inference (livekit.agents.inference),
     # billed through your LiveKit Cloud account: no DEEPGRAM_API_KEY,
     # GOOGLE_API_KEY, OPENAI_API_KEY needed for those two.
@@ -895,7 +922,7 @@ async def entrypoint(ctx: JobContext):
             inference.TTS(
                 model="fishaudio/s2.1-pro",
                 voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-                extra_kwargs={"speed": 1.35, "temperature": 0, "latency": "normal"},
+                extra_kwargs={"speed": 1.30, "temperature": 0, "latency": "normal"},
             ),
 
             inference.TTS(
@@ -956,6 +983,11 @@ async def entrypoint(ctx: JobContext):
         # finish rather than being lost. "Hold on" / "Wait, stop" (2+
         # words) still interrupt immediately.
         min_interruption_words=2,
+        # How long the customer can go quiet before the silence safety net
+        # below (_on_user_state_changed) fires "Are you still with me?".
+        # Framework default is 15s; shortened so a genuinely dead line gets
+        # caught and closed out faster.
+        user_away_timeout=6.0,
     )
 
     # session.emit("metrics_collected", MetricsCollectedEvent(metrics=...)) wraps
@@ -1056,6 +1088,80 @@ async def entrypoint(ctx: JobContext):
             hmm_filler_task.cancel()
 
     session.on("agent_state_changed", _on_agent_state_changed)
+
+    # Silence safety net: the LLM only reacts to turns, so if the customer
+    # goes quiet it can't act on its own. After user_away_timeout (6s, set
+    # above) of no user activity, check in once, then hang up if nothing
+    # follows.
+    #
+    # Registered here — before session.start()/the greeting/AMD — rather
+    # than after them (as this used to be): AgentSession arms its away-timer
+    # as soon as the session starts, so a listener only attached after the
+    # ~10s AMD window could miss the very first "away" transition entirely.
+    # That transition doesn't reliably repeat on its own (AgentSession only
+    # re-arms the timer when the agent and user both transition INTO
+    # "listening" at the same moment), so a missed one used to mean no
+    # safety net at all until some unrelated event happened to re-arm it —
+    # which is exactly what let one real call sit in ~4 minutes of dead air
+    # before this ever fired. AMD only pauses the agent's own auto-reply
+    # authorization (AgentActivity._pause_authorization), not user-state
+    # tracking, so this stays live and correct straight through the
+    # greeting/AMD window too — session.say() below simply queues until AMD
+    # releases that lock if this fires mid-detection.
+    checked_in = False
+
+    def _cancel_pending_silence_shutdown() -> None:
+        nonlocal checked_in, silence_shutdown_task
+        checked_in = False
+        if silence_shutdown_task is not None and not silence_shutdown_task.done():
+            silence_shutdown_task.cancel()
+
+    def _on_user_state_changed(ev):
+        nonlocal checked_in, silence_shutdown_task
+        if ev.new_state == "speaking":
+            # Unambiguous real speech (VAD-confirmed, not just a stray final
+            # transcript) — safe to cancel here directly rather than waiting
+            # on _on_user_input_transcribed, which can lag several seconds
+            # behind the STT provider (e.g. mid-fallover on the STT
+            # FallbackAdapter).
+            _cancel_pending_silence_shutdown()
+            return
+        if ev.new_state != "away":
+            # A bare away→listening transition isn't itself trustworthy: per
+            # AgentSession._user_input_transcribed, ANY final transcript —
+            # including an empty one from a stray noise/VAD-miss blip — resets
+            # away straight back to listening, with no content check. Don't
+            # cancel our own countdown on that alone; wait for
+            # _on_user_input_transcribed below to confirm real content
+            # actually came through.
+            return
+        if not checked_in:
+            checked_in = True
+            # session.say() returns a SpeechHandle (already queued/running,
+            # not a coroutine) — wrapping it in asyncio.create_task() raises
+            # TypeError, so it's called directly, fire-and-forget.
+            session.say("Are you still with me?", allow_interruptions=True)
+            silence_shutdown_task = asyncio.create_task(_shutdown_after_silence())
+
+    async def _shutdown_after_silence() -> None:
+        await asyncio.sleep(SILENCE_SHUTDOWN_DELAY_SECONDS)
+        ctx.shutdown(reason="no response after silence check")
+
+    def _on_user_input_transcribed(ev) -> None:
+        # A real call showed the bot repeating "Are you still with me?"
+        # three times over ~5 minutes without ever hanging up: background
+        # line noise kept producing stray *final* transcripts (sometimes
+        # empty strings), each of which resets the framework's away state to
+        # "listening" unconditionally (see note above) — and, previously,
+        # cancelled our hang-up countdown right along with it, so the
+        # countdown never once ran to completion. Only a final transcript
+        # with actual non-blank content counts as evidence the caller is
+        # really there.
+        if ev.is_final and ev.transcript.strip():
+            _cancel_pending_silence_shutdown()
+
+    session.on("user_state_changed", _on_user_state_changed)
+    session.on("user_input_transcribed", _on_user_input_transcribed)
 
     # Build the initial instructions synchronously — no blocking wait on the
     # customer lookup here. This previously did `await asyncio.wait_for(
@@ -1243,43 +1349,6 @@ async def entrypoint(ctx: JobContext):
             # opening_stall_task/GREETING_V2_WAV_PATH is the only thing
             # that covers the silence until they do.
             pass
-
-    # Silence safety net: the LLM only reacts to turns, so if the customer
-    # goes quiet it can't act on its own. After user_away_timeout (15s
-    # default) of no user activity, check in once.
-    #
-    # This does NOT wait for a second "away" event to decide whether to hang
-    # up — the framework's away-timer is one-shot and only re-arms when the
-    # agent and user both transition INTO "listening" at the same moment.
-    # Once state is "away", nothing routine flips it back: under genuine
-    # silence it just sticks, so a second "away" event may never arrive at
-    # all; on a noisy line, a stray STT final-transcript resets away→listening
-    # as a VAD-miss safety net, which can accidentally re-arm the timer —
-    # unpredictable either way. So instead: on the first "away", start our
-    # own plain timer: if the caller hasn't spoken by the time it fires,
-    # hang up, regardless of what the framework's own state does next.
-    checked_in = False
-
-    def _on_user_state_changed(ev):
-        nonlocal checked_in, silence_shutdown_task
-        if ev.new_state != "away":
-            checked_in = False
-            if silence_shutdown_task is not None and not silence_shutdown_task.done():
-                silence_shutdown_task.cancel()
-            return
-        if not checked_in:
-            checked_in = True
-            # session.say() returns a SpeechHandle (already queued/running,
-            # not a coroutine) — wrapping it in asyncio.create_task() raises
-            # TypeError, so it's called directly, fire-and-forget.
-            session.say("Are you still with me?", allow_interruptions=True)
-            silence_shutdown_task = asyncio.create_task(_shutdown_after_silence())
-
-    async def _shutdown_after_silence() -> None:
-        await asyncio.sleep(SILENCE_SHUTDOWN_DELAY_SECONDS)
-        ctx.shutdown(reason="no response after silence check")
-
-    session.on("user_state_changed", _on_user_state_changed)
 
     # No keep-alive loop here on purpose. The call's actual lifetime is
     # governed by the job's internal shutdown future (set by ctx.shutdown()
