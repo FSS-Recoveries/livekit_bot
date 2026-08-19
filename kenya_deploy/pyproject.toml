@@ -1,0 +1,24 @@
+[project]
+name = "livekit-bot"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.11.0",
+    "azure-cognitiveservices-speech>=1.51.1",
+    "firebase-admin>=7.5.0",
+    "google-cloud-bigquery>=3.43.0",
+    "livekit==1.1.13",
+    "livekit-agents==1.6.7",
+    "livekit-api==1.2.0",
+    "livekit-plugins-azure==1.6.7",
+    "livekit-plugins-deepgram==1.6.7",
+    "livekit-plugins-elevenlabs==1.6.7",
+    "livekit-plugins-google>=1.6.7",
+    "livekit-plugins-noise-cancellation>=0.3.0",
+    "livekit-plugins-openai==1.6.7",
+    "livekit-plugins-silero==1.6.7",
+    "python-dotenv>=1.0.1",
+    "requests>=2.32.0",
+    "tzdata>=2026.3",
+]

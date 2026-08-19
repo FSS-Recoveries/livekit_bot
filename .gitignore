@@ -8,3 +8,5 @@ service_account.json
 *service-account*.json
 *serviceAccount*.json
 *.log
+kenya_voice_samples/
+kenya_deploy/.secrets
