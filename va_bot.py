@@ -415,9 +415,17 @@ async def _fetch_customer_snapshot(phone_number: str) -> dict:
 )
 async def get_customer_info(ctx: RunContext, phone_number: str) -> str:
     normalized = _normalize_nigerian_phone(phone_number)
+    no_match_result = (
+        f"No customer record found for phone number {normalized}. The "
+        f"no_details recording has already been played to the customer and "
+        f"the call is ending — do not speak, and do not call end_call yourself."
+    )
     try:
         data = await _fetch_customer_snapshot(phone_number)
         active_lead = data.get("active_lead") or {}
+        if not active_lead:
+            await _play_no_details_and_end_call(get_job_context())
+            return no_match_result
         first_name = active_lead.get("first_name", "")
         last_name = active_lead.get("surname", "")
         return (
@@ -426,7 +434,8 @@ async def get_customer_info(ctx: RunContext, phone_number: str) -> str:
         )
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
-            return f"No customer record found for phone number {normalized}."
+            await _play_no_details_and_end_call(get_job_context())
+            return no_match_result
         return f"HTTP error fetching customer info: {e}"
     except requests.RequestException as e:
         return f"Error fetching customer info: {e}"
@@ -480,6 +489,16 @@ async def _ensure_call_ends(job_ctx: JobContext) -> None:
         print("end_call: room still connected after all retries; giving up")
 
 
+async def _play_no_details_and_end_call(job_ctx: JobContext) -> None:
+    """No matching customer record for this call. Plays the pre-recorded
+    no_details.wav (bypassing TTS, same rationale as the opening greeting —
+    a fixed, deterministic line doesn't need to go through the LLM/TTS
+    pipeline) and hangs up, the same way end_call does."""
+    await _play_wav_greeting(job_ctx.room, NO_DETAILS_WAV_PATH)
+    job_ctx.shutdown(reason="no matching customer record")
+    asyncio.create_task(_ensure_call_ends(job_ctx))
+
+
 _LAGOS_TZ = ZoneInfo("Africa/Lagos")
 
 
@@ -487,7 +506,7 @@ _LAGOS_TZ = ZoneInfo("Africa/Lagos")
     description=(
         "Re-check the current date and time in Nigeria (Africa/Lagos, West "
         "Africa Time), plus the three standard payment deadline dates ('the "
-        "4-day deadline', 'the 7-day deadline', and 'the 30-day deadline'). "
+        "3-day deadline', 'the 7-day deadline', and 'the 30-day deadline'). "
         "Your instructions already give you today's date and all three "
         "deadline dates at the start of this call — treat those as "
         "authoritative and do not call this tool to re-derive them. Only call "
@@ -496,23 +515,23 @@ _LAGOS_TZ = ZoneInfo("Africa/Lagos")
         "the customer says ('this Friday', 'tomorrow') into an exact calendar "
         "date. Never guess, assume, do your own date arithmetic, or rely on "
         "your training data for today's date — call this instead, and always "
-        "speak the actual returned dates, never the '4 days'/'7 days'/'30 "
+        "speak the actual returned dates, never the '3 days'/'7 days'/'30 "
         "days' reasoning behind them."
     )
 )
 async def get_current_datetime(ctx: RunContext) -> str:
     now = datetime.now(_LAGOS_TZ)
-    four_day_deadline = now + timedelta(days=4)
+    three_day_deadline = now + timedelta(days=3)
     seven_day_deadline = now + timedelta(days=7)
     thirty_day_deadline = now + timedelta(days=30)
     return (
         f"Current date and time: {now.strftime('%A, %B %d, %Y, %I:%M %p')} "
         f"West Africa Time. ISO date: {now.date().isoformat()}. "
-        f"4-day payment deadline (speak this exact date, never 'in 4 days' or "
-        f"'this week'): {four_day_deadline.strftime('%A, %B %d, %Y')}. "
+        f"3-day payment deadline (speak this exact date, never 'in 3 days' or "
+        f"'this week'): {three_day_deadline.strftime('%A, %B %d, %Y')}. "
         f"7-day payment deadline — only for the discount lock-in window, or as "
         f"a special one-time exception when the customer cannot meet the "
-        f"4-day deadline (speak this exact date, never 'in 7 days' or 'this "
+        f"3-day deadline (speak this exact date, never 'in 7 days' or 'this "
         f"week'): {seven_day_deadline.strftime('%A, %B %d, %Y')}. "
         f"30-day payment deadline (speak this exact date, never 'in 30 days' or "
         f"'end of month'): {thirty_day_deadline.strftime('%A, %B %d, %Y')}."
@@ -685,6 +704,9 @@ GREETING_WAV_PATH = os.path.join(os.getcwd(), "Greeting.wav")
 # OPENING_STALL_DELAY_SECONDS after GREETING_WAV_PATH finishes (customer
 # info / AMD still resolving).
 GREETING_V2_WAV_PATH = os.path.join(os.getcwd(), "Greeting v2.wav")
+# Played (bypassing TTS, same rationale as the greeting) instead of a spoken
+# line whenever get_customer_info comes back with no matching account.
+NO_DETAILS_WAV_PATH = os.path.join(os.getcwd(), "no_details.wav")
 OPENING_STALL_DELAY_SECONDS = 3
 # From the agent's first real turn onward, how long it can sit "thinking"
 # before speaking a short "Hmm" filler while the real reply keeps loading.
@@ -839,22 +861,22 @@ async def entrypoint(ctx: JobContext):
     # exists as a fallback for edge cases (the customer disputes today's
     # date, or the call runs unusually long).
     _call_start_dt = datetime.now(_LAGOS_TZ)
-    _four_day_deadline_dt = _call_start_dt + timedelta(days=4)
+    _three_day_deadline_dt = _call_start_dt + timedelta(days=3)
     _seven_day_deadline_dt = _call_start_dt + timedelta(days=7)
     _thirty_day_deadline_dt = _call_start_dt + timedelta(days=30)
     system_prompt += (
         f"\n\nCURRENT DATE CONTEXT (authoritative for this entire call — never "
         f"override with your own sense of today's date, and never do your own "
         f"date arithmetic): today is "
-        f"{_call_start_dt.strftime('%A, %B %d, %Y')}. The 4-day payment "
-        f"deadline is {_four_day_deadline_dt.strftime('%A, %B %d, %Y')}. The "
+        f"{_call_start_dt.strftime('%A, %B %d, %Y')}. The 3-day payment "
+        f"deadline is {_three_day_deadline_dt.strftime('%A, %B %d, %Y')}. The "
         f"7-day payment deadline is {_seven_day_deadline_dt.strftime('%A, %B %d, %Y')} "
         f"— use this only for the discount lock-in window, or as a special "
-        f"one-time exception when a customer cannot meet the 4-day deadline. "
+        f"one-time exception when a customer cannot meet the 3-day deadline. "
         f"The 30-day payment deadline is "
         f"{_thirty_day_deadline_dt.strftime('%A, %B %d, %Y')}. These are fixed "
         f"for the rest of this call — speak them exactly as given here, never "
-        f"as 'in 4 days', 'in 7 days', 'this week', 'in 30 days', or 'end of "
+        f"as 'in 3 days', 'in 7 days', 'this week', 'in 30 days', or 'end of "
         f"month'. Only call get_current_datetime if the customer disputes "
         f"today's date or the call has been running for a long time."
     )
@@ -1216,6 +1238,13 @@ async def entrypoint(ctx: JobContext):
         if not customer_data:
             return
         active_lead = customer_data.get("active_lead") or {}
+        if not active_lead:
+            # No matching account. Leave the fallback instructions in place
+            # (set above) so the model calls get_customer_info itself once
+            # the session has actually started — that call site plays
+            # no_details.wav and hangs up. Doing it directly from here would
+            # race with the greeting/AMD sequence, which hasn't run yet.
+            return
         enriched_prompt = system_prompt + (
             f"\n\nThe customer has already been identified as "
             f"{active_lead.get('first_name', '')} {active_lead.get('surname', '')} "
