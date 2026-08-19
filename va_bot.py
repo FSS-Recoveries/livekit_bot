@@ -486,28 +486,34 @@ _LAGOS_TZ = ZoneInfo("Africa/Lagos")
 @function_tool(
     description=(
         "Re-check the current date and time in Nigeria (Africa/Lagos, West "
-        "Africa Time), plus the two standard payment deadline dates ('the 7-day "
-        "deadline' and 'the 30-day deadline'). Your instructions already give "
-        "you today's date and both deadline dates at the start of this call — "
-        "treat those as authoritative and do not call this tool to re-derive "
-        "them. Only call this if the customer disputes today's date, the call "
-        "has been running for an unusually long time, or you need to convert "
-        "something the customer says ('this Friday', 'tomorrow') into an exact "
-        "calendar date. Never guess, assume, do your own date arithmetic, or "
-        "rely on your training data for today's date — call this instead, and "
-        "always speak the actual returned dates, never the '7 days'/'30 days' "
-        "reasoning behind them."
+        "Africa Time), plus the three standard payment deadline dates ('the "
+        "4-day deadline', 'the 7-day deadline', and 'the 30-day deadline'). "
+        "Your instructions already give you today's date and all three "
+        "deadline dates at the start of this call — treat those as "
+        "authoritative and do not call this tool to re-derive them. Only call "
+        "this if the customer disputes today's date, the call has been "
+        "running for an unusually long time, or you need to convert something "
+        "the customer says ('this Friday', 'tomorrow') into an exact calendar "
+        "date. Never guess, assume, do your own date arithmetic, or rely on "
+        "your training data for today's date — call this instead, and always "
+        "speak the actual returned dates, never the '4 days'/'7 days'/'30 "
+        "days' reasoning behind them."
     )
 )
 async def get_current_datetime(ctx: RunContext) -> str:
     now = datetime.now(_LAGOS_TZ)
+    four_day_deadline = now + timedelta(days=4)
     seven_day_deadline = now + timedelta(days=7)
     thirty_day_deadline = now + timedelta(days=30)
     return (
         f"Current date and time: {now.strftime('%A, %B %d, %Y, %I:%M %p')} "
         f"West Africa Time. ISO date: {now.date().isoformat()}. "
-        f"7-day payment deadline (speak this exact date, never 'in 7 days' or "
-        f"'this week'): {seven_day_deadline.strftime('%A, %B %d, %Y')}. "
+        f"4-day payment deadline (speak this exact date, never 'in 4 days' or "
+        f"'this week'): {four_day_deadline.strftime('%A, %B %d, %Y')}. "
+        f"7-day payment deadline — only for the discount lock-in window, or as "
+        f"a special one-time exception when the customer cannot meet the "
+        f"4-day deadline (speak this exact date, never 'in 7 days' or 'this "
+        f"week'): {seven_day_deadline.strftime('%A, %B %d, %Y')}. "
         f"30-day payment deadline (speak this exact date, never 'in 30 days' or "
         f"'end of month'): {thirty_day_deadline.strftime('%A, %B %d, %Y')}."
     )
@@ -833,20 +839,24 @@ async def entrypoint(ctx: JobContext):
     # exists as a fallback for edge cases (the customer disputes today's
     # date, or the call runs unusually long).
     _call_start_dt = datetime.now(_LAGOS_TZ)
+    _four_day_deadline_dt = _call_start_dt + timedelta(days=4)
     _seven_day_deadline_dt = _call_start_dt + timedelta(days=7)
     _thirty_day_deadline_dt = _call_start_dt + timedelta(days=30)
     system_prompt += (
         f"\n\nCURRENT DATE CONTEXT (authoritative for this entire call — never "
         f"override with your own sense of today's date, and never do your own "
         f"date arithmetic): today is "
-        f"{_call_start_dt.strftime('%A, %B %d, %Y')}. The 7-day payment "
-        f"deadline is {_seven_day_deadline_dt.strftime('%A, %B %d, %Y')}. The "
-        f"30-day payment deadline is "
+        f"{_call_start_dt.strftime('%A, %B %d, %Y')}. The 4-day payment "
+        f"deadline is {_four_day_deadline_dt.strftime('%A, %B %d, %Y')}. The "
+        f"7-day payment deadline is {_seven_day_deadline_dt.strftime('%A, %B %d, %Y')} "
+        f"— use this only for the discount lock-in window, or as a special "
+        f"one-time exception when a customer cannot meet the 4-day deadline. "
+        f"The 30-day payment deadline is "
         f"{_thirty_day_deadline_dt.strftime('%A, %B %d, %Y')}. These are fixed "
         f"for the rest of this call — speak them exactly as given here, never "
-        f"as 'in 7 days', 'this week', 'in 30 days', or 'end of month'. Only "
-        f"call get_current_datetime if the customer disputes today's date or "
-        f"the call has been running for a long time."
+        f"as 'in 4 days', 'in 7 days', 'this week', 'in 30 days', or 'end of "
+        f"month'. Only call get_current_datetime if the customer disputes "
+        f"today's date or the call has been running for a long time."
     )
 
     # Providers — STT and LLM via LiveKit Inference (livekit.agents.inference),
