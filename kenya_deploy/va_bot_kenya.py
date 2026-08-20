@@ -513,18 +513,18 @@ _NAIROBI_TZ = ZoneInfo("Africa/Nairobi")
 
 @function_tool(
     description=(
-        "Get the current date and time in Kenya (Africa/Nairobi, East Africa Time), "
-        "plus the two standard payment deadline dates used throughout the offer "
-        "ladder and discount lock-in ('the 7-day deadline' and 'the 30-day "
-        "deadline' — 7 and 30 calendar days from this call, not the end of the "
-        "current week or calendar month). Call this once near the start of every "
-        "call, and again any time you need to reason about a relative date — "
-        "converting something the customer says ('this Friday', 'tomorrow') into "
-        "an exact calendar date, or checking whether an existing ptp_date has "
-        "already passed. Never guess, assume, do your own date arithmetic, or rely "
-        "on your training data for today's date or these deadlines — always call "
-        "this instead, and always speak the actual returned dates to the customer, "
-        "never the '7 days'/'30 days' reasoning behind them."
+        "Re-check the current date and time in Kenya (Africa/Nairobi, East "
+        "Africa Time), plus the two standard payment deadline dates ('the 7-day "
+        "deadline' and 'the 30-day deadline'). Your instructions already give "
+        "you today's date and both deadline dates at the start of this call — "
+        "treat those as authoritative and do not call this tool to re-derive "
+        "them. Only call this if the customer disputes today's date, the call "
+        "has been running for an unusually long time, or you need to convert "
+        "something the customer says ('this Friday', 'kesho') into an exact "
+        "calendar date. Never guess, assume, do your own date arithmetic, or "
+        "rely on your training data for today's date — call this instead, and "
+        "always speak the actual returned dates, never the '7 days'/'30 days' "
+        "reasoning behind them."
     )
 )
 async def get_current_datetime(ctx: RunContext) -> str:
@@ -876,6 +876,33 @@ async def entrypoint(ctx: JobContext):
             system_prompt = f.read().strip()
     except FileNotFoundError:
         system_prompt = "You are Shanice, a debt collection assistant."
+
+    # Ground the model in the real current date via code, not tool-call
+    # discipline. Ported from va_bot.py: the model was observed relying on
+    # get_current_datetime being called (and remembered correctly) throughout
+    # a long negotiation, and instead doing its own date arithmetic mid-call
+    # and confidently stating a wrong year for the 7-day/30-day deadlines.
+    # Baking the actual dates into the instructions means they're present in
+    # every single turn's context for the rest of the call — nothing to
+    # recall, nothing to compute, nothing to get wrong. get_current_datetime
+    # still exists as a fallback for edge cases (the customer disputes
+    # today's date, or the call runs unusually long).
+    _call_start_dt = datetime.now(_NAIROBI_TZ)
+    _seven_day_deadline_dt = _call_start_dt + timedelta(days=7)
+    _thirty_day_deadline_dt = _call_start_dt + timedelta(days=30)
+    system_prompt += (
+        f"\n\nCURRENT DATE CONTEXT (authoritative for this entire call — never "
+        f"override with your own sense of today's date, and never do your own "
+        f"date arithmetic): today is "
+        f"{_call_start_dt.strftime('%A, %B %d, %Y')}. The 7-day payment "
+        f"deadline is {_seven_day_deadline_dt.strftime('%A, %B %d, %Y')}. The "
+        f"30-day payment deadline is "
+        f"{_thirty_day_deadline_dt.strftime('%A, %B %d, %Y')}. These are fixed "
+        f"for the rest of this call — speak them exactly as given here, never "
+        f"as 'in 7 days', 'this week', 'in 30 days', or 'end of month'. Only "
+        f"call get_current_datetime if the customer disputes today's date or "
+        f"the call has been running for a long time."
+    )
 
     # Providers — STT and LLM via LiveKit Inference (livekit.agents.inference),
     # billed through your LiveKit Cloud account: no DEEPGRAM_API_KEY,
