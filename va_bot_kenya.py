@@ -419,8 +419,17 @@ async def _fetch_customer_snapshot(phone_number: str) -> dict:
 )
 async def get_customer_info(ctx: RunContext, phone_number: str) -> str:
     normalized = _normalize_kenyan_phone(phone_number)
+    # Diagnostic timing (STT/turn-detection reliability investigation, Aug
+    # 2026): this LLM tool call blocks the agent's current turn until it
+    # resolves — while it's in flight, whether newly-arriving customer
+    # speech gets finalized/acted on promptly is an open question under
+    # investigation. fss-api is Render-hosted and known to have slow cold
+    # starts; logging exactly how long this takes settles whether that's a
+    # real contributing factor rather than guessing from call recordings.
+    _t0 = time.time()
     try:
         data = await _fetch_customer_snapshot(phone_number)
+        print(f"[tool] get_customer_info took {time.time() - _t0:.2f}s")
         active_lead = data.get("active_lead") or {}
         first_name = active_lead.get("first_name", "")
         last_name = active_lead.get("surname", "")
@@ -429,10 +438,12 @@ async def get_customer_info(ctx: RunContext, phone_number: str) -> str:
             f"Full response: {data}"
         )
     except requests.HTTPError as e:
+        print(f"[tool] get_customer_info took {time.time() - _t0:.2f}s (HTTPError)")
         if e.response is not None and e.response.status_code == 404:
             return f"No customer record found for phone number {normalized}."
         return f"HTTP error fetching customer info: {e}"
     except requests.RequestException as e:
+        print(f"[tool] get_customer_info took {time.time() - _t0:.2f}s (RequestException)")
         return f"Error fetching customer info: {e}"
 
 
@@ -1309,10 +1320,15 @@ async def entrypoint(ctx: JobContext):
         fallback instructions set above already have the model do that
         itself once the caller starts talking, so nothing breaks either way.
         """
+        _t0 = time.time()
         try:
             customer_data = await asyncio.wait_for(lookup_task, timeout=3)
+            print(f"[tool] background customer lookup took {time.time() - _t0:.2f}s")
         except (asyncio.TimeoutError, requests.RequestException) as e:
-            print(f"Customer lookup failed or timed out: {e}")
+            print(
+                f"[tool] background customer lookup failed/timed out after "
+                f"{time.time() - _t0:.2f}s: {e}"
+            )
             return
         if not customer_data:
             return
