@@ -1104,6 +1104,12 @@ async def entrypoint(ctx: JobContext):
         text = getattr(item, "text_content", None)
         if role and text:
             transcript_lines.append(f"{role}: {text}")
+            # Diagnostic logging (STT/turn-detection reliability investigation,
+            # Aug 2026): a real test call showed clear English speech never
+            # becoming a registered turn at all — this line at least confirms
+            # WHEN a turn does land, for comparison against what was actually
+            # said on the recording.
+            print(f"[turn] conversation_item_added role={role} text={text!r}")
         # Belt-and-suspenders: a real assistant utterance just landed, so any
         # pending "Hmm" filler is moot. Cancelling only on the "speaking"
         # state transition isn't always enough — a slow/chunked TTS
@@ -1156,6 +1162,10 @@ async def entrypoint(ctx: JobContext):
 
     def _on_agent_state_changed(ev) -> None:
         nonlocal first_response_delivered, opening_stall_task, hmm_filler_task
+        # Diagnostic logging (STT/turn-detection reliability investigation,
+        # Aug 2026) — correlates against [user_state]/[stt] log lines to see
+        # exactly what the agent was doing when a turn should have landed.
+        print(f"[agent_state] {ev.old_state} -> {ev.new_state}")
         if ev.new_state == "speaking":
             if not first_response_delivered:
                 first_response_delivered = True
@@ -1200,6 +1210,10 @@ async def entrypoint(ctx: JobContext):
 
     def _on_user_state_changed(ev):
         nonlocal checked_in, silence_shutdown_task
+        # Diagnostic logging (STT/turn-detection reliability investigation,
+        # Aug 2026) — every VAD-level state transition, to correlate against
+        # actual speech timing from the call recording.
+        print(f"[user_state] {ev.old_state} -> {ev.new_state}")
         if ev.new_state == "speaking":
             # Unambiguous real speech (VAD-confirmed, not just a stray final
             # transcript) — safe to cancel here directly rather than waiting
@@ -1232,6 +1246,19 @@ async def entrypoint(ctx: JobContext):
         ctx.shutdown(reason="no response after silence check")
 
     def _on_user_input_transcribed(ev) -> None:
+        # Diagnostic logging (STT/turn-detection reliability investigation,
+        # Aug 2026): a real test call showed the caller speaking two clear,
+        # ordinary English sentences (confirmed independently by transcribing
+        # the call recording itself afterward) that never once produced a
+        # registered turn — no STT-level exception was logged either, so
+        # whatever failed did so silently. This logs EVERY event from this
+        # handler, interim and final alike, with the detected language, so
+        # the next occurrence is caught live instead of reconstructed after
+        # the fact from a recording.
+        print(
+            f"[stt] is_final={ev.is_final} language={ev.language!r} "
+            f"transcript={ev.transcript!r}"
+        )
         # Without this: a stray or hallucinated *final* transcript (empty
         # noise blip, or a language-detection glitch producing foreign-
         # language text from an ambiguous short utterance — both observed in
