@@ -876,9 +876,17 @@ async def entrypoint(ctx: JobContext):
         else:
             print("Warning: no SIP participant found within timeout")
         print(f"Customer phone number: {phone_number}")
+    else:
+        # Console mode has no SIP participant to pull a real number from.
+        # Defaulting to a known test number here (temporary, for the
+        # ongoing get_customer_info/lookup-timing investigation) skips
+        # needing to speak a phone number aloud on every test call — never
+        # applies to a real call, since is_console is never true for one.
+        phone_number = os.getenv("KENYA_TEST_PHONE_NUMBER", "08134073764")
+        print(f"Console mode — using test phone number: {phone_number}")
 
-        if phone_number:
-            lookup_task = asyncio.create_task(_fetch_customer_snapshot(phone_number))
+    if phone_number:
+        lookup_task = asyncio.create_task(_fetch_customer_snapshot(phone_number))
 
     # Load system prompt (fallback if file missing)
     prompt_path = os.path.join(os.getcwd(), "prompt_kenya.txt")
