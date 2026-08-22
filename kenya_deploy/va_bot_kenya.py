@@ -230,6 +230,12 @@ _GEMINI_FLASH_LITE_OUTPUT_PER_TOKEN = 1.50 / 1_000_000  # includes thinking toke
 _GPT5_MINI_INPUT_PER_TOKEN = 0.25 / 1_000_000
 _GPT5_MINI_CACHED_INPUT_PER_TOKEN = 0.030 / 1_000_000
 _GPT5_MINI_OUTPUT_PER_TOKEN = 2.00 / 1_000_000
+# OpenAI gpt-4o-mini-transcribe (the STT FallbackAdapter's second entry —
+# used only when ElevenLabs Scribe errors out) had no cost entry either,
+# same gap as Scribe above. From platform.openai.com/docs/pricing as of
+# 2026-08-21: $1.25/1M audio input tokens, $5.00/1M text output tokens.
+_GPT4O_MINI_TRANSCRIBE_INPUT_PER_TOKEN = 1.25 / 1_000_000
+_GPT4O_MINI_TRANSCRIBE_OUTPUT_PER_TOKEN = 5.00 / 1_000_000
 # Direct ElevenLabs API rate (not Inference — see note above), from
 # elevenlabs.io/pricing/api as of 2026-08-12: "$0.05 per 1K characters" for
 # the Flash/Turbo tier, which eleven_flash_v2_5 falls under.
@@ -286,6 +292,11 @@ def _estimate_entry_cost(entry: dict) -> float | None:
         return entry.get("characters_count", 0) * _ELEVENLABS_FLASH_PER_CHARACTER
     if model == "elevenlabs/scribe_v2_realtime":
         return entry.get("audio_duration", 0) * _ELEVENLABS_SCRIBE_V2_REALTIME_PER_SECOND
+    if provider == "api.openai.com" and model == "gpt-4o-mini-transcribe":
+        return (
+            entry.get("input_tokens", 0) * _GPT4O_MINI_TRANSCRIBE_INPUT_PER_TOKEN
+            + entry.get("output_tokens", 0) * _GPT4O_MINI_TRANSCRIBE_OUTPUT_PER_TOKEN
+        )
     if provider == "Deepgram" and model == "nova-3":
         return entry.get("audio_duration", 0) * _DEEPGRAM_NOVA3_PER_SECOND
     if model == "fishaudio/s2.1-pro":
@@ -468,6 +479,12 @@ async def set_active_language(ctx: RunContext, language: str) -> str:
     if not tts_by_language or normalized not in tts_by_language:
         return f"Unknown language '{language}'. Use 'english' or 'swahili'."
     ctx.session.current_agent.update_options(tts=tts_by_language[normalized])
+    # Tracked so our own hardcoded safety-net lines (silence check-in,
+    # max-call-duration close — neither goes through the LLM, so neither
+    # would otherwise know the call had switched languages) can also speak
+    # in the right language instead of always defaulting to English.
+    if ctx.userdata is not None:
+        ctx.userdata["active_language"] = normalized
     return f"Active language switched to {normalized}."
 
 
@@ -876,17 +893,9 @@ async def entrypoint(ctx: JobContext):
         else:
             print("Warning: no SIP participant found within timeout")
         print(f"Customer phone number: {phone_number}")
-    else:
-        # Console mode has no SIP participant to pull a real number from.
-        # Defaulting to a known test number here (temporary, for the
-        # ongoing get_customer_info/lookup-timing investigation) skips
-        # needing to speak a phone number aloud on every test call — never
-        # applies to a real call, since is_console is never true for one.
-        phone_number = os.getenv("KENYA_TEST_PHONE_NUMBER", "08134073764")
-        print(f"Console mode — using test phone number: {phone_number}")
 
-    if phone_number:
-        lookup_task = asyncio.create_task(_fetch_customer_snapshot(phone_number))
+        if phone_number:
+            lookup_task = asyncio.create_task(_fetch_customer_snapshot(phone_number))
 
     # Load system prompt (fallback if file missing)
     prompt_path = os.path.join(os.getcwd(), "prompt_kenya.txt")
@@ -970,7 +979,24 @@ async def entrypoint(ctx: JobContext):
             # model="scribe_v2_realtime" already selects realtime mode; the
             # plugin logs a warning if use_realtime=True is also passed
             # alongside it (it's simply ignored), so it's left out here.
-            elevenlabs.STT(model="scribe_v2_realtime"),
+            #
+            # server_vad: without this, the plugin's commit_strategy defaults
+            # to "manual" (see livekit/plugins/elevenlabs/stt.py
+            # _connect_ws), meaning ElevenLabs only finalizes a transcript
+            # when OUR client-side VAD explicitly signals end-of-speech —
+            # never from its own read of the audio. A real Kenya test call
+            # showed a complete, clearly-finished sentence stay
+            # is_final=False for the rest of the call (confirmed via the
+            # [stt] diagnostic logging: the interim transcript stopped
+            # growing but never committed), eventually hanging up on the
+            # caller mid-negotiation. Setting server_vad switches
+            # commit_strategy to "vad", so ElevenLabs' own server-side
+            # silence detection decides finalization directly from the raw
+            # audio it receives, independent of our client VAD.
+            elevenlabs.STT(
+                model="scribe_v2_realtime",
+                server_vad={},
+            ),
             openai.STT(detect_language=True),
         ],
         vad=vad,
@@ -1192,6 +1218,16 @@ async def entrypoint(ctx: JobContext):
                     opening_stall_task.cancel()
             if hmm_filler_task is not None and not hmm_filler_task.done():
                 hmm_filler_task.cancel()
+            # The agent speaking a real reply is itself proof the call is
+            # alive and progressing — but a silence-shutdown countdown
+            # armed by an EARLIER away-timeout (before this reply started
+            # generating/speaking) keeps running regardless, since it's
+            # only ever cancelled by user-side signals below. Seen live: the
+            # countdown from a prior check-in expired mid-reply and killed
+            # the call while the agent was still mid-sentence. Cancel it
+            # here too so a stale user-silence timer can never cut off a
+            # response the agent is actively giving.
+            _cancel_pending_silence_shutdown()
             return
         if ev.new_state == "thinking":
             if hmm_filler_task is None or hmm_filler_task.done():
@@ -1234,12 +1270,20 @@ async def entrypoint(ctx: JobContext):
         # actual speech timing from the call recording.
         print(f"[user_state] {ev.old_state} -> {ev.new_state}")
         if ev.new_state == "speaking":
-            # Unambiguous real speech (VAD-confirmed, not just a stray final
-            # transcript) — safe to cancel here directly rather than waiting
-            # on _on_user_input_transcribed, which can lag several seconds
-            # behind the STT provider (e.g. mid-fallover on the STT
-            # FallbackAdapter).
-            _cancel_pending_silence_shutdown()
+            # Only cancel the pending hang-up here, not the full
+            # checked_in flag. A real Kenya test call showed a brief,
+            # content-free away->speaking->listening blip landing right
+            # after our own "Are you still with me?" line finished (almost
+            # certainly TTS bleeding back into the mic) — resetting
+            # checked_in on that alone made the check-in re-fire and get
+            # spoken again every time the blip repeated, three times in a
+            # row in that call. Deferring the hang-up here still protects
+            # against killing a call mid slow-to-finalize real speech
+            # (the original reason this branch exists); checked_in only
+            # resets on confirmed real content, in
+            # _on_user_input_transcribed below.
+            if silence_shutdown_task is not None and not silence_shutdown_task.done():
+                silence_shutdown_task.cancel()
             return
         if ev.new_state != "away":
             # A bare away→listening transition isn't itself trustworthy: per
@@ -1257,8 +1301,21 @@ async def entrypoint(ctx: JobContext):
             # session.say() returns a SpeechHandle (already queued/running,
             # not a coroutine) — wrapping it in asyncio.create_task() raises
             # TypeError, so it's called directly, fire-and-forget.
-            session.say("Are you still with me?", allow_interruptions=True)
-            silence_shutdown_task = asyncio.create_task(_shutdown_after_silence())
+            #
+            # Bypasses the LLM entirely, so it doesn't know the call's
+            # active language on its own — a real Kenya test call showed
+            # this spoken in English mid-Swahili-conversation, confusing
+            # the caller. Read the language set_active_language last
+            # switched to (ctx.userdata) instead of hardcoding English.
+            active_language = session.userdata.get("active_language", "english")
+            checkin_line = (
+                "Uko pale?" if active_language == "swahili" else "Are you still with me?"
+            )
+            session.say(checkin_line, allow_interruptions=True)
+        # Re-arm the hang-up countdown on every away entry, even a repeat
+        # one following a blip above — just without saying the check-in
+        # line again, so an echo/noise blip loop can no longer spam it.
+        silence_shutdown_task = asyncio.create_task(_shutdown_after_silence())
 
     async def _shutdown_after_silence() -> None:
         await asyncio.sleep(SILENCE_SHUTDOWN_DELAY_SECONDS)
@@ -1395,10 +1452,17 @@ async def entrypoint(ctx: JobContext):
         if ctx.room.connection_state != rtc.ConnectionState.CONN_CONNECTED:
             return  # call already ended for some other reason
         try:
-            await session.say(
-                "We're at the time limit for this call, so I have to go now. Thank you.",
-                allow_interruptions=False,
+            # Bypasses the LLM, so — same issue as the silence check-in
+            # above — it wouldn't otherwise know the call had switched to
+            # Swahili. Machine-translated; worth a native-speaker check.
+            active_language = session.userdata.get("active_language", "english")
+            closing_line = (
+                "Muda wa simu hii umefika mwisho, kwa hivyo nitahitaji "
+                "kuondoka sasa. Asante."
+                if active_language == "swahili"
+                else "We're at the time limit for this call, so I have to go now. Thank you."
             )
+            await session.say(closing_line, allow_interruptions=False)
         except Exception as e:
             print(f"Failed to speak max-call-duration closing line: {e}")
         ctx.shutdown(reason="max call duration (6 min) reached")
