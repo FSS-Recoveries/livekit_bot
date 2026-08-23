@@ -475,6 +475,13 @@ async def get_customer_info(ctx: RunContext, phone_number: str) -> str:
 )
 async def set_active_language(ctx: RunContext, language: str) -> str:
     normalized = language.strip().lower()
+    # Diagnostic logging (language-switch reliability investigation, Aug
+    # 2026) — this tool call was previously invisible in the logs; a real
+    # Kenya test call showed the active language flip from Swahili back to
+    # English mid-call with no explicit request, and there was no way to
+    # tell whether that was this tool being called again unprompted or the
+    # LLM just generating English text while the Swahili TTS stayed active.
+    print(f"[tool] set_active_language called with language={language!r}")
     tts_by_language = ctx.userdata.get("tts_by_language") if ctx.userdata else None
     if not tts_by_language or normalized not in tts_by_language:
         return f"Unknown language '{language}'. Use 'english' or 'swahili'."
