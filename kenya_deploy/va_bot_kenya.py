@@ -513,18 +513,18 @@ _NAIROBI_TZ = ZoneInfo("Africa/Nairobi")
 
 @function_tool(
     description=(
-        "Get the current date and time in Kenya (Africa/Nairobi, East Africa Time), "
-        "plus the two standard payment deadline dates used throughout the offer "
-        "ladder and discount lock-in ('the 7-day deadline' and 'the 30-day "
-        "deadline' — 7 and 30 calendar days from this call, not the end of the "
-        "current week or calendar month). Call this once near the start of every "
-        "call, and again any time you need to reason about a relative date — "
-        "converting something the customer says ('this Friday', 'tomorrow') into "
-        "an exact calendar date, or checking whether an existing ptp_date has "
-        "already passed. Never guess, assume, do your own date arithmetic, or rely "
-        "on your training data for today's date or these deadlines — always call "
-        "this instead, and always speak the actual returned dates to the customer, "
-        "never the '7 days'/'30 days' reasoning behind them."
+        "Re-check the current date and time in Kenya (Africa/Nairobi, East "
+        "Africa Time), plus the two standard payment deadline dates ('the 7-day "
+        "deadline' and 'the 30-day deadline'). Your instructions already give "
+        "you today's date and both deadline dates at the start of this call — "
+        "treat those as authoritative and do not call this tool to re-derive "
+        "them. Only call this if the customer disputes today's date, the call "
+        "has been running for an unusually long time, or you need to convert "
+        "something the customer says ('this Friday', 'kesho') into an exact "
+        "calendar date. Never guess, assume, do your own date arithmetic, or "
+        "rely on your training data for today's date — call this instead, and "
+        "always speak the actual returned dates, never the '7 days'/'30 days' "
+        "reasoning behind them."
     )
 )
 async def get_current_datetime(ctx: RunContext) -> str:
@@ -877,6 +877,33 @@ async def entrypoint(ctx: JobContext):
     except FileNotFoundError:
         system_prompt = "You are Shanice, a debt collection assistant."
 
+    # Ground the model in the real current date via code, not tool-call
+    # discipline. Ported from va_bot.py: the model was observed relying on
+    # get_current_datetime being called (and remembered correctly) throughout
+    # a long negotiation, and instead doing its own date arithmetic mid-call
+    # and confidently stating a wrong year for the 7-day/30-day deadlines.
+    # Baking the actual dates into the instructions means they're present in
+    # every single turn's context for the rest of the call — nothing to
+    # recall, nothing to compute, nothing to get wrong. get_current_datetime
+    # still exists as a fallback for edge cases (the customer disputes
+    # today's date, or the call runs unusually long).
+    _call_start_dt = datetime.now(_NAIROBI_TZ)
+    _seven_day_deadline_dt = _call_start_dt + timedelta(days=7)
+    _thirty_day_deadline_dt = _call_start_dt + timedelta(days=30)
+    system_prompt += (
+        f"\n\nCURRENT DATE CONTEXT (authoritative for this entire call — never "
+        f"override with your own sense of today's date, and never do your own "
+        f"date arithmetic): today is "
+        f"{_call_start_dt.strftime('%A, %B %d, %Y')}. The 7-day payment "
+        f"deadline is {_seven_day_deadline_dt.strftime('%A, %B %d, %Y')}. The "
+        f"30-day payment deadline is "
+        f"{_thirty_day_deadline_dt.strftime('%A, %B %d, %Y')}. These are fixed "
+        f"for the rest of this call — speak them exactly as given here, never "
+        f"as 'in 7 days', 'this week', 'in 30 days', or 'end of month'. Only "
+        f"call get_current_datetime if the customer disputes today's date or "
+        f"the call has been running for a long time."
+    )
+
     # Providers — STT and LLM via LiveKit Inference (livekit.agents.inference),
     # billed through your LiveKit Cloud account: no DEEPGRAM_API_KEY,
     # GOOGLE_API_KEY, OPENAI_API_KEY needed for those two.
@@ -1077,6 +1104,12 @@ async def entrypoint(ctx: JobContext):
         text = getattr(item, "text_content", None)
         if role and text:
             transcript_lines.append(f"{role}: {text}")
+            # Diagnostic logging (STT/turn-detection reliability investigation,
+            # Aug 2026): a real test call showed clear English speech never
+            # becoming a registered turn at all — this line at least confirms
+            # WHEN a turn does land, for comparison against what was actually
+            # said on the recording.
+            print(f"[turn] conversation_item_added role={role} text={text!r}")
         # Belt-and-suspenders: a real assistant utterance just landed, so any
         # pending "Hmm" filler is moot. Cancelling only on the "speaking"
         # state transition isn't always enough — a slow/chunked TTS
@@ -1129,6 +1162,10 @@ async def entrypoint(ctx: JobContext):
 
     def _on_agent_state_changed(ev) -> None:
         nonlocal first_response_delivered, opening_stall_task, hmm_filler_task
+        # Diagnostic logging (STT/turn-detection reliability investigation,
+        # Aug 2026) — correlates against [user_state]/[stt] log lines to see
+        # exactly what the agent was doing when a turn should have landed.
+        print(f"[agent_state] {ev.old_state} -> {ev.new_state}")
         if ev.new_state == "speaking":
             if not first_response_delivered:
                 first_response_delivered = True
@@ -1173,6 +1210,10 @@ async def entrypoint(ctx: JobContext):
 
     def _on_user_state_changed(ev):
         nonlocal checked_in, silence_shutdown_task
+        # Diagnostic logging (STT/turn-detection reliability investigation,
+        # Aug 2026) — every VAD-level state transition, to correlate against
+        # actual speech timing from the call recording.
+        print(f"[user_state] {ev.old_state} -> {ev.new_state}")
         if ev.new_state == "speaking":
             # Unambiguous real speech (VAD-confirmed, not just a stray final
             # transcript) — safe to cancel here directly rather than waiting
@@ -1205,6 +1246,19 @@ async def entrypoint(ctx: JobContext):
         ctx.shutdown(reason="no response after silence check")
 
     def _on_user_input_transcribed(ev) -> None:
+        # Diagnostic logging (STT/turn-detection reliability investigation,
+        # Aug 2026): a real test call showed the caller speaking two clear,
+        # ordinary English sentences (confirmed independently by transcribing
+        # the call recording itself afterward) that never once produced a
+        # registered turn — no STT-level exception was logged either, so
+        # whatever failed did so silently. This logs EVERY event from this
+        # handler, interim and final alike, with the detected language, so
+        # the next occurrence is caught live instead of reconstructed after
+        # the fact from a recording.
+        print(
+            f"[stt] is_final={ev.is_final} language={ev.language!r} "
+            f"transcript={ev.transcript!r}"
+        )
         # Without this: a stray or hallucinated *final* transcript (empty
         # noise blip, or a language-detection glitch producing foreign-
         # language text from an ambiguous short utterance — both observed in
