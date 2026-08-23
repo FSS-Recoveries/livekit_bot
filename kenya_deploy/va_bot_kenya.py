@@ -1303,6 +1303,19 @@ async def entrypoint(ctx: JobContext):
             # countdown on that alone; wait for _on_user_input_transcribed
             # below to confirm real content actually came through.
             return
+        if not first_response_delivered:
+            # The greeting redesign (short pre-recorded "Hello" + the live
+            # LLM's own first turn carrying the real introduction) means
+            # there's now a real gap — AMD classifying, the customer
+            # lookup, LLM+TTS generating that first turn — before the
+            # agent has said anything substantive. A real Kenya call
+            # showed "away" firing and "Are you still with me?" being
+            # spoken during exactly that gap, before the introduction had
+            # ever been said — confusing, since there was no prior context
+            # to be "still with". This isn't the customer going quiet on
+            # an ongoing conversation; it's normal startup latency, so
+            # there's nothing to check in on yet.
+            return
         if not checked_in:
             checked_in = True
             # session.say() returns a SpeechHandle (already queued/running,
