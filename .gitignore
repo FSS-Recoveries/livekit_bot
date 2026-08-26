@@ -10,3 +10,8 @@ service_account.json
 *.log
 kenya_voice_samples/
 kenya_deploy/.secrets
+
+# Local convenience symlink to kenya_deploy/va_bot_kenya.py — the real file
+# lives in kenya_deploy/ only; this stays untracked so GitHub shows one
+# canonical copy instead of two files that can drift out of sync.
+/va_bot_kenya.py
