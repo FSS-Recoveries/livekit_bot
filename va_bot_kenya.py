@@ -483,9 +483,16 @@ async def set_active_language(ctx: RunContext, language: str) -> str:
     # LLM just generating English text while the Swahili TTS stayed active.
     print(f"[tool] set_active_language called with language={language!r}")
     tts_by_language = ctx.userdata.get("tts_by_language") if ctx.userdata else None
+    stt_by_language = ctx.userdata.get("stt_by_language") if ctx.userdata else None
     if not tts_by_language or normalized not in tts_by_language:
         return f"Unknown language '{language}'. Use 'english' or 'swahili'."
-    ctx.session.current_agent.update_options(tts=tts_by_language[normalized])
+    update_kwargs = {"tts": tts_by_language[normalized]}
+    # Pin STT to the now-known language instead of leaving it on per-utterance
+    # auto-detect for the rest of the call — see build_stt_for_language's
+    # docstring for why that auto-detect was misfiring on Swahili.
+    if stt_by_language and normalized in stt_by_language:
+        update_kwargs["stt"] = stt_by_language[normalized]
+    ctx.session.current_agent.update_options(**update_kwargs)
     # Tracked so our own hardcoded safety-net lines (silence check-in,
     # max-call-duration close — neither goes through the LLM, so neither
     # would otherwise know the call had switched languages) can also speak
@@ -1008,6 +1015,39 @@ async def entrypoint(ctx: JobContext):
         ],
         vad=vad,
     )
+
+    def build_stt_for_language(language_code: str) -> agents_stt.FallbackAdapter:
+        """Same engine pairing as the auto-detecting `stt` above, but with the
+        language pinned instead of auto-detected on every utterance.
+
+        Real Kenya test calls showed auto-detect misfire mid-call after the
+        customer had already explicitly picked Swahili — e.g. actual Swahili
+        speech ("Sina pesa") transcribed as unrelated garbage, and in several
+        calls the detector picked Russian outright, producing Cyrillic
+        transcripts (see set_active_language's docstring). Once
+        set_active_language knows which language is active, there's no
+        reason to keep re-guessing it per utterance — pinning removes that
+        failure mode entirely. Kept as a separate adapter (rather than
+        mutating `stt` in place) so the opening turns — before the customer's
+        language is known — still get real auto-detection.
+        """
+        return agents_stt.FallbackAdapter(
+            [
+                elevenlabs.STT(
+                    model="scribe_v2_realtime",
+                    server_vad={},
+                    language=language_code,
+                ),
+                openai.STT(language=language_code),
+            ],
+            vad=vad,
+        )
+
+    stt_by_language = {
+        "english": build_stt_for_language("en"),
+        "swahili": build_stt_for_language("sw"),
+    }
+
     # LLM: Gemini 3.1 Flash-Lite as primary, gpt-5-mini as fallback if
     # Gemini errors out. Worth knowing: Gemini 2.5 (Flash and Flash-Lite) has
     # a documented upstream quirk where it can return finish_reason=STOP
@@ -1096,8 +1136,8 @@ async def entrypoint(ctx: JobContext):
         tts=tts,
         # Exposed to the set_active_language tool via ctx.userdata, so it
         # can swap the active per-language FallbackAdapter at runtime — see
-        # the TTS setup above and set_active_language's docstring.
-        userdata={"tts_by_language": tts_by_language},
+        # the TTS/STT setup above and set_active_language's docstring.
+        userdata={"tts_by_language": tts_by_language, "stt_by_language": stt_by_language},
         turn_detection=TurnDetector(),
         preemptive_generation=True,
         # Real call transcripts showed a repeating "Hello? Hello? Hello?"
