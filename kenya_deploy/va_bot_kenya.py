@@ -1036,7 +1036,7 @@ async def entrypoint(ctx: JobContext):
                 elevenlabs.STT(
                     model="scribe_v2_realtime",
                     server_vad={},
-                    language=language_code,
+                    language_code=language_code,
                 ),
                 openai.STT(language=language_code),
             ],
