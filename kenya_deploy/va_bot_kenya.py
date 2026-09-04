@@ -615,7 +615,13 @@ def build_elevenlabs_tts():
         "similarity_boost": 0.9,
         "style": 0.9,
         "use_speaker_boost": False,#True,
-        "speed": .4,  # dropped automatically if unsupported
+        # ElevenLabs rejects speed outside [0.7, 1.2] — 0.4 (presumably meant
+        # as "40% slower") was never a valid value and got a 400 from their
+        # API on every real call. Every ElevenLabs TTS attempt in production
+        # has been silently failing on this alone, regardless of voice_id.
+        # 0.7 is their floor — the closest available approximation of the
+        # originally-intended slower delivery.
+        "speed": 0.7,
     }
 
     def _filter_kwargs(cls, kwargs):
