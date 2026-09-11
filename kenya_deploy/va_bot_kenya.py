@@ -994,51 +994,51 @@ async def entrypoint(ctx: JobContext):
     # STT in the list can be auto-wrapped with stt.StreamAdapter via a VAD —
     # caught by a console-mode smoke test before this ever reached a real
     # call (every call would have crashed on connect otherwise).
-    stt = agents_stt.FallbackAdapter(
-        [
-            # model="scribe_v2_realtime" already selects realtime mode; the
-            # plugin logs a warning if use_realtime=True is also passed
-            # alongside it (it's simply ignored), so it's left out here.
-            #
-            # server_vad: without this, the plugin's commit_strategy defaults
-            # to "manual" (see livekit/plugins/elevenlabs/stt.py
-            # _connect_ws), meaning ElevenLabs only finalizes a transcript
-            # when OUR client-side VAD explicitly signals end-of-speech —
-            # never from its own read of the audio. A real Kenya test call
-            # showed a complete, clearly-finished sentence stay
-            # is_final=False for the rest of the call (confirmed via the
-            # [stt] diagnostic logging: the interim transcript stopped
-            # growing but never committed), eventually hanging up on the
-            # caller mid-negotiation. Setting server_vad switches
-            # commit_strategy to "vad", so ElevenLabs' own server-side
-            # silence detection decides finalization directly from the raw
-            # audio it receives, independent of our client VAD.
-            elevenlabs.STT(
-                model="scribe_v2_realtime",
-                server_vad={},
-            ),
-            openai.STT(detect_language=True),
-        ],
-        vad=vad,
-    )
-
     def build_stt_for_language(language_code: str) -> agents_stt.FallbackAdapter:
-        """Same engine pairing as the auto-detecting `stt` above, but with the
-        language pinned instead of auto-detected on every utterance.
+        """Same engine pairing, pinned to a specific language rather than
+        auto-detected.
 
-        Real Kenya test calls showed auto-detect misfire mid-call after the
-        customer had already explicitly picked Swahili — e.g. actual Swahili
-        speech ("Sina pesa") transcribed as unrelated garbage, and in several
-        calls the detector picked Russian outright, producing Cyrillic
-        transcripts (see set_active_language's docstring). Once
-        set_active_language knows which language is active, there's no
-        reason to keep re-guessing it per utterance — pinning removes that
-        failure mode entirely. Kept as a separate adapter (rather than
-        mutating `stt` in place) so the opening turns — before the customer's
-        language is known — still get real auto-detection.
+        Real Kenya call transcripts showed open auto-detection (no
+        language_code/detect_language=True) badly misfire — not just on
+        mid-call Swahili turns after the customer had already picked a
+        language, but routinely on the very first utterance of a call,
+        confidently transcribing a Kenyan customer's "Alo"/"Hello" as fluent
+        Russian, Portuguese, Dutch, Chinese, or Arabic. In several cases the
+        wrong-language guess then persisted for the entire call rather than
+        correcting itself, producing a fully garbled transcript and, in the
+        worst cases, the agent stuck re-introducing itself for minutes
+        because it could never get a turn it recognized as an answer. Since
+        Kenyan customers only ever speak English, Swahili, or Sheng (see the
+        prompt's Language Selection Rule), and Sheng renders as a rough
+        mix of the two either way, there is no real call where auto-detect's
+        wider net helps — it only adds a failure mode neither engine needs.
+        Pinning to English before the customer's language is known (see
+        `stt` below) still lets Swahili/Sheng speech through as workable,
+        if imperfect, transcription — the same tradeoff already accepted
+        for TTS defaulting to English at call start.
         """
         return agents_stt.FallbackAdapter(
             [
+                # model="scribe_v2_realtime" already selects realtime mode;
+                # the plugin logs a warning if use_realtime=True is also
+                # passed alongside it (it's simply ignored), so it's left
+                # out here.
+                #
+                # server_vad: without this, the plugin's commit_strategy
+                # defaults to "manual" (see
+                # livekit/plugins/elevenlabs/stt.py _connect_ws), meaning
+                # ElevenLabs only finalizes a transcript when OUR
+                # client-side VAD explicitly signals end-of-speech — never
+                # from its own read of the audio. A real Kenya test call
+                # showed a complete, clearly-finished sentence stay
+                # is_final=False for the rest of the call (confirmed via
+                # the [stt] diagnostic logging: the interim transcript
+                # stopped growing but never committed), eventually hanging
+                # up on the caller mid-negotiation. Setting server_vad
+                # switches commit_strategy to "vad", so ElevenLabs' own
+                # server-side silence detection decides finalization
+                # directly from the raw audio it receives, independent of
+                # our client VAD.
                 elevenlabs.STT(
                     model="scribe_v2_realtime",
                     server_vad={},
@@ -1053,6 +1053,11 @@ async def entrypoint(ctx: JobContext):
         "english": build_stt_for_language("en"),
         "swahili": build_stt_for_language("sw"),
     }
+    # Every call opens in English per the Language Selection Rule — the
+    # model hasn't heard the customer speak yet, so there's nothing to
+    # match. Also used for AMD below, which mostly needs to read English
+    # voicemail/IVR menu prompts ("Press one to save...").
+    stt = stt_by_language["english"]
 
     # LLM: Gemini 3.1 Flash-Lite as primary, gpt-5-mini as fallback if
     # Gemini errors out. Worth knowing: Gemini 2.5 (Flash and Flash-Lite) has
