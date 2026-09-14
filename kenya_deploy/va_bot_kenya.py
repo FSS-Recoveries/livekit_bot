@@ -1149,25 +1149,49 @@ async def entrypoint(ctx: JobContext):
         # can swap the active per-language FallbackAdapter at runtime — see
         # the TTS/STT setup above and set_active_language's docstring.
         userdata={"tts_by_language": tts_by_language, "stt_by_language": stt_by_language},
-        turn_detection=TurnDetector(),
-        preemptive_generation=True,
-        # Real call transcripts showed a repeating "Hello? Hello? Hello?"
-        # cascade: the customer says a bare "Hello?" mid-sentence, it cuts
-        # off Shanice's current speech as a real interruption, she restarts,
-        # gets cut off again, and it loops. A 1-word utterance doesn't hit
-        # min_interruption_duration (0.5s default) reliably enough to be
-        # filtered by that alone. min_interruption_words=2 stops a single
-        # word like "Hello"/"Hi"/"Yes"/"No" from counting as an
-        # interruption at all — it only suppresses cutting Shanice off
-        # mid-sentence; the transcript is still tracked, so if the customer
-        # keeps talking past 2 words it interrupts normally, and a bare
-        # "Hello?" that stops there still gets handled as the next turn
-        # once her current line finishes. Trade-off: genuine one-word
-        # interruptions ("Stop!", "Wait!") also won't cut her off
-        # instantly — they wait for her current (already short) sentence to
-        # finish rather than being lost. "Hold on" / "Wait, stop" (2+
-        # words) still interrupt immediately.
-        min_interruption_words=2,
+        # Migrated off the deprecated flat kwargs (turn_detection=,
+        # preemptive_generation=, min_interruption_words=) onto
+        # turn_handling=TurnHandlingOptions(...) specifically for
+        # interruption.mode="adaptive" and resume_false_interruption below —
+        # neither is reachable through the old flat kwargs at all.
+        #
+        # Real call transcripts showed a repeating "Hello? Hello? Hello?" /
+        # "Mm. Mm." cascade: the customer backchannels ("hm", "yes", a bare
+        # "Hello?") while Shanice is mid-sentence, the old word-count-only
+        # min_interruption_words=2 config still cut her off the moment ANY
+        # 2+-word utterance landed (STT often splits a repeated filler like
+        # "Mm. Mm." into two tokens), she restarted the same point from
+        # scratch, got cut off again, and it looped — customer and bot
+        # visibly missing each other rather than talking past a normal
+        # backchannel. min_words=2 alone doesn't fix this: a real customer
+        # genuinely saying two short backchannel words in a row still hits
+        # the same threshold.
+        #
+        # interruption.mode="adaptive" replaces blind word-counting with
+        # the framework's ML backchannel classifier, which is aware of
+        # content/context ("hm"/"yes"/"mm" vs. a real objection), not just
+        # length — min_words=2 is kept alongside it purely as a
+        # defense-in-depth floor against a single bare word ("Hello"/"Hi")
+        # still being classified as a real interruption.
+        #
+        # resume_false_interruption=True (the framework default, made
+        # explicit here) is the other half: if speech the adaptive
+        # classifier treats as a genuine interruption is followed by
+        # silence within false_interruption_timeout (no real new turn
+        # actually materializes), Shanice RESUMES the exact sentence she
+        # was cut off in instead of the LLM generating a fresh, similarly-
+        # worded reply — this is what actually stops the repeat-loop,
+        # rather than just reducing how often it's triggered.
+        turn_handling={
+            "turn_detection": TurnDetector(),
+            "preemptive_generation": {"enabled": True},
+            "interruption": {
+                "mode": "adaptive",
+                "min_words": 2,
+                "resume_false_interruption": True,
+                "false_interruption_timeout": 2.0,
+            },
+        },
         # How long the customer can go quiet before the silence safety net
         # below (_on_user_state_changed) fires "Are you still with me?".
         # Framework default is 15s; shortened so a genuinely dead line (or a
