@@ -1039,9 +1039,19 @@ async def entrypoint(ctx: JobContext):
                 # server-side silence detection decides finalization
                 # directly from the raw audio it receives, independent of
                 # our client VAD.
+                #
+                # vad_threshold/min_speech_duration_ms raised above
+                # ElevenLabs' own defaults (0.4 / 250ms) for the same
+                # reason our own Silero VAD's min_speech_duration was
+                # raised in prewarm() -- this is a second, independent VAD
+                # layer specific to ElevenLabs' realtime engine, and real
+                # calls showed it fabricating short "final" customer
+                # turns from near-silence even when our client-side VAD
+                # was the one instructed to decide finalization here.
+                # 300ms stays under a genuine bare "Yes" (~300-400ms).
                 elevenlabs.STT(
                     model="scribe_v2_realtime",
-                    server_vad={},
+                    server_vad={"vad_threshold": 0.5, "min_speech_duration_ms": 300},
                     language_code=language_code,
                 ),
                 openai.STT(language=language_code),
@@ -1662,7 +1672,18 @@ def prewarm(proc):
     model here instead of inside entrypoint() means every call reuses the
     already-loaded model instead of paying its load cost before the greeting
     can play."""
-    proc.userdata["vad"] = silero.VAD.load()
+    # min_speech_duration default is 0.05s (50ms) -- real call transcripts
+    # showed customer turns fabricated from near-silence (a click, a
+    # breath, faint noise), sometimes multiple different invented lines in
+    # the same call, confirmed against the actual recordings via an
+    # independent offline transcription showing no real customer speech at
+    # those points at all. 50ms is enough for VAD alone to declare "speech
+    # started" from a blip that was never going to be real speech, handing
+    # STT almost nothing to work with -- which it fills in rather than
+    # abstaining. 0.2s stays well under any real spoken word (a bare "Yes"
+    # runs ~300-400ms, "Swahili" ~500-700ms) while filtering out sub-200ms
+    # noise this bot has no legitimate reason to treat as a turn.
+    proc.userdata["vad"] = silero.VAD.load(min_speech_duration=0.2)
 
 
 if __name__ == "__main__":
