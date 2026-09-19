@@ -994,54 +994,64 @@ async def entrypoint(ctx: JobContext):
     # STT in the list can be auto-wrapped with stt.StreamAdapter via a VAD —
     # caught by a console-mode smoke test before this ever reached a real
     # call (every call would have crashed on connect otherwise).
-    stt = agents_stt.FallbackAdapter(
-        [
-            # model="scribe_v2_realtime" already selects realtime mode; the
-            # plugin logs a warning if use_realtime=True is also passed
-            # alongside it (it's simply ignored), so it's left out here.
-            #
-            # server_vad: without this, the plugin's commit_strategy defaults
-            # to "manual" (see livekit/plugins/elevenlabs/stt.py
-            # _connect_ws), meaning ElevenLabs only finalizes a transcript
-            # when OUR client-side VAD explicitly signals end-of-speech —
-            # never from its own read of the audio. A real Kenya test call
-            # showed a complete, clearly-finished sentence stay
-            # is_final=False for the rest of the call (confirmed via the
-            # [stt] diagnostic logging: the interim transcript stopped
-            # growing but never committed), eventually hanging up on the
-            # caller mid-negotiation. Setting server_vad switches
-            # commit_strategy to "vad", so ElevenLabs' own server-side
-            # silence detection decides finalization directly from the raw
-            # audio it receives, independent of our client VAD.
-            elevenlabs.STT(
-                model="scribe_v2_realtime",
-                server_vad={},
-            ),
-            openai.STT(detect_language=True),
-        ],
-        vad=vad,
-    )
-
     def build_stt_for_language(language_code: str) -> agents_stt.FallbackAdapter:
-        """Same engine pairing as the auto-detecting `stt` above, but with the
-        language pinned instead of auto-detected on every utterance.
+        """Same engine pairing, pinned to a specific language rather than
+        auto-detected.
 
-        Real Kenya test calls showed auto-detect misfire mid-call after the
-        customer had already explicitly picked Swahili — e.g. actual Swahili
-        speech ("Sina pesa") transcribed as unrelated garbage, and in several
-        calls the detector picked Russian outright, producing Cyrillic
-        transcripts (see set_active_language's docstring). Once
-        set_active_language knows which language is active, there's no
-        reason to keep re-guessing it per utterance — pinning removes that
-        failure mode entirely. Kept as a separate adapter (rather than
-        mutating `stt` in place) so the opening turns — before the customer's
-        language is known — still get real auto-detection.
+        Real Kenya call transcripts showed open auto-detection (no
+        language_code/detect_language=True) badly misfire — not just on
+        mid-call Swahili turns after the customer had already picked a
+        language, but routinely on the very first utterance of a call,
+        confidently transcribing a Kenyan customer's "Alo"/"Hello" as fluent
+        Russian, Portuguese, Dutch, Chinese, or Arabic. In several cases the
+        wrong-language guess then persisted for the entire call rather than
+        correcting itself, producing a fully garbled transcript and, in the
+        worst cases, the agent stuck re-introducing itself for minutes
+        because it could never get a turn it recognized as an answer. Since
+        Kenyan customers only ever speak English, Swahili, or Sheng (see the
+        prompt's Language Selection Rule), and Sheng renders as a rough
+        mix of the two either way, there is no real call where auto-detect's
+        wider net helps — it only adds a failure mode neither engine needs.
+        Pinning to English before the customer's language is known (see
+        `stt` below) still lets Swahili/Sheng speech through as workable,
+        if imperfect, transcription — the same tradeoff already accepted
+        for TTS defaulting to English at call start.
         """
         return agents_stt.FallbackAdapter(
             [
+                # model="scribe_v2_realtime" already selects realtime mode;
+                # the plugin logs a warning if use_realtime=True is also
+                # passed alongside it (it's simply ignored), so it's left
+                # out here.
+                #
+                # server_vad: without this, the plugin's commit_strategy
+                # defaults to "manual" (see
+                # livekit/plugins/elevenlabs/stt.py _connect_ws), meaning
+                # ElevenLabs only finalizes a transcript when OUR
+                # client-side VAD explicitly signals end-of-speech — never
+                # from its own read of the audio. A real Kenya test call
+                # showed a complete, clearly-finished sentence stay
+                # is_final=False for the rest of the call (confirmed via
+                # the [stt] diagnostic logging: the interim transcript
+                # stopped growing but never committed), eventually hanging
+                # up on the caller mid-negotiation. Setting server_vad
+                # switches commit_strategy to "vad", so ElevenLabs' own
+                # server-side silence detection decides finalization
+                # directly from the raw audio it receives, independent of
+                # our client VAD.
+                #
+                # vad_threshold/min_speech_duration_ms raised above
+                # ElevenLabs' own defaults (0.4 / 250ms) for the same
+                # reason our own Silero VAD's min_speech_duration was
+                # raised in prewarm() -- this is a second, independent VAD
+                # layer specific to ElevenLabs' realtime engine, and real
+                # calls showed it fabricating short "final" customer
+                # turns from near-silence even when our client-side VAD
+                # was the one instructed to decide finalization here.
+                # 300ms stays under a genuine bare "Yes" (~300-400ms).
                 elevenlabs.STT(
                     model="scribe_v2_realtime",
-                    server_vad={},
+                    server_vad={"vad_threshold": 0.5, "min_speech_duration_ms": 300},
                     language_code=language_code,
                 ),
                 openai.STT(language=language_code),
@@ -1053,6 +1063,11 @@ async def entrypoint(ctx: JobContext):
         "english": build_stt_for_language("en"),
         "swahili": build_stt_for_language("sw"),
     }
+    # Every call opens in English per the Language Selection Rule — the
+    # model hasn't heard the customer speak yet, so there's nothing to
+    # match. Also used for AMD below, which mostly needs to read English
+    # voicemail/IVR menu prompts ("Press one to save...").
+    stt = stt_by_language["english"]
 
     # LLM: Gemini 3.1 Flash-Lite as primary, gpt-5-mini as fallback if
     # Gemini errors out. Worth knowing: Gemini 2.5 (Flash and Flash-Lite) has
@@ -1144,25 +1159,49 @@ async def entrypoint(ctx: JobContext):
         # can swap the active per-language FallbackAdapter at runtime — see
         # the TTS/STT setup above and set_active_language's docstring.
         userdata={"tts_by_language": tts_by_language, "stt_by_language": stt_by_language},
-        turn_detection=TurnDetector(),
-        preemptive_generation=True,
-        # Real call transcripts showed a repeating "Hello? Hello? Hello?"
-        # cascade: the customer says a bare "Hello?" mid-sentence, it cuts
-        # off Shanice's current speech as a real interruption, she restarts,
-        # gets cut off again, and it loops. A 1-word utterance doesn't hit
-        # min_interruption_duration (0.5s default) reliably enough to be
-        # filtered by that alone. min_interruption_words=2 stops a single
-        # word like "Hello"/"Hi"/"Yes"/"No" from counting as an
-        # interruption at all — it only suppresses cutting Shanice off
-        # mid-sentence; the transcript is still tracked, so if the customer
-        # keeps talking past 2 words it interrupts normally, and a bare
-        # "Hello?" that stops there still gets handled as the next turn
-        # once her current line finishes. Trade-off: genuine one-word
-        # interruptions ("Stop!", "Wait!") also won't cut her off
-        # instantly — they wait for her current (already short) sentence to
-        # finish rather than being lost. "Hold on" / "Wait, stop" (2+
-        # words) still interrupt immediately.
-        min_interruption_words=2,
+        # Migrated off the deprecated flat kwargs (turn_detection=,
+        # preemptive_generation=, min_interruption_words=) onto
+        # turn_handling=TurnHandlingOptions(...) specifically for
+        # interruption.mode="adaptive" and resume_false_interruption below —
+        # neither is reachable through the old flat kwargs at all.
+        #
+        # Real call transcripts showed a repeating "Hello? Hello? Hello?" /
+        # "Mm. Mm." cascade: the customer backchannels ("hm", "yes", a bare
+        # "Hello?") while Shanice is mid-sentence, the old word-count-only
+        # min_interruption_words=2 config still cut her off the moment ANY
+        # 2+-word utterance landed (STT often splits a repeated filler like
+        # "Mm. Mm." into two tokens), she restarted the same point from
+        # scratch, got cut off again, and it looped — customer and bot
+        # visibly missing each other rather than talking past a normal
+        # backchannel. min_words=2 alone doesn't fix this: a real customer
+        # genuinely saying two short backchannel words in a row still hits
+        # the same threshold.
+        #
+        # interruption.mode="adaptive" replaces blind word-counting with
+        # the framework's ML backchannel classifier, which is aware of
+        # content/context ("hm"/"yes"/"mm" vs. a real objection), not just
+        # length — min_words=2 is kept alongside it purely as a
+        # defense-in-depth floor against a single bare word ("Hello"/"Hi")
+        # still being classified as a real interruption.
+        #
+        # resume_false_interruption=True (the framework default, made
+        # explicit here) is the other half: if speech the adaptive
+        # classifier treats as a genuine interruption is followed by
+        # silence within false_interruption_timeout (no real new turn
+        # actually materializes), Shanice RESUMES the exact sentence she
+        # was cut off in instead of the LLM generating a fresh, similarly-
+        # worded reply — this is what actually stops the repeat-loop,
+        # rather than just reducing how often it's triggered.
+        turn_handling={
+            "turn_detection": TurnDetector(),
+            "preemptive_generation": {"enabled": True},
+            "interruption": {
+                "mode": "adaptive",
+                "min_words": 2,
+                "resume_false_interruption": True,
+                "false_interruption_timeout": 2.0,
+            },
+        },
         # How long the customer can go quiet before the silence safety net
         # below (_on_user_state_changed) fires "Are you still with me?".
         # Framework default is 15s; shortened so a genuinely dead line (or a
@@ -1633,7 +1672,18 @@ def prewarm(proc):
     model here instead of inside entrypoint() means every call reuses the
     already-loaded model instead of paying its load cost before the greeting
     can play."""
-    proc.userdata["vad"] = silero.VAD.load()
+    # min_speech_duration default is 0.05s (50ms) -- real call transcripts
+    # showed customer turns fabricated from near-silence (a click, a
+    # breath, faint noise), sometimes multiple different invented lines in
+    # the same call, confirmed against the actual recordings via an
+    # independent offline transcription showing no real customer speech at
+    # those points at all. 50ms is enough for VAD alone to declare "speech
+    # started" from a blip that was never going to be real speech, handing
+    # STT almost nothing to work with -- which it fills in rather than
+    # abstaining. 0.2s stays well under any real spoken word (a bare "Yes"
+    # runs ~300-400ms, "Swahili" ~500-700ms) while filtering out sub-200ms
+    # noise this bot has no legitimate reason to treat as a turn.
+    proc.userdata["vad"] = silero.VAD.load(min_speech_duration=0.2)
 
 
 if __name__ == "__main__":
