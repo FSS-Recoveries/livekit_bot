@@ -1008,7 +1008,26 @@ async def entrypoint(ctx: JobContext):
         llm=llm,
         vad=vad,
         tts=tts,
-        turn_detection=TurnDetector(),
+        # Turn detection was cutting customers off too readily — the
+        # framework default (~0.36 unlikely_threshold, 0.3s/2.5s min/max
+        # endpointing delay) is tuned for fast turn-taking, but on phone
+        # audio a normal pause (reciting an account number, thinking
+        # mid-sentence) reads as "done talking" and Mary jumps in.
+        # unlikely_threshold raised so the EOU model needs much higher
+        # confidence before committing on the short delay; anything less
+        # certain falls through to max_endpointing_delay below instead of
+        # ending the turn early.
+        turn_detection=TurnDetector(unlikely_threshold=0.6),
+        # Floor: how long the customer's silence must hold, even when the
+        # EOU model is confident they're done, before Mary responds.
+        # Framework default is 0.3s — raised so a normal breath/pause
+        # doesn't get read as the end of the turn.
+        min_endpointing_delay=0.6,
+        # Ceiling: how long Mary waits when the EOU model isn't confident
+        # (see unlikely_threshold above). Framework default is 2.5s —
+        # raised so a genuinely hesitant customer still gets a beat before
+        # she jumps in.
+        max_endpointing_delay=4.0,
         preemptive_generation=True,
         # Real call transcripts showed a repeating "Hello? Hello? Hello?"
         # cascade: the customer says a bare "Hello?" mid-sentence, it cuts
