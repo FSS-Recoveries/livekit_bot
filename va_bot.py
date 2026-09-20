@@ -969,11 +969,11 @@ async def entrypoint(ctx: JobContext):
                 extra_kwargs={"speed": 1.30, "temperature": 0, "latency": "normal"},
             ),
 
-            inference.TTS(
-                model="inworld/inworld-tts-1.5-max",
-                voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-                extra_kwargs={"speaking_rate": 1.35, "temperature": 0, "latency": "normal"},
-                ),
+            #inference.TTS(
+            #    model="inworld/inworld-tts-1.5-max",
+            #    voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
+            #    extra_kwargs={"speaking_rate": 1.35, "temperature": 0, "latency": "normal"},
+            #   ),
                 
             build_elevenlabs_tts(),
 
