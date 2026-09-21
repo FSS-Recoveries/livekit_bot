@@ -966,13 +966,13 @@ async def entrypoint(ctx: JobContext):
         [
             inference.TTS(
                 model="fishaudio/s2.1-pro",
-                voice="v_E8hZCwkMtY7y",#"v_VeRxYTHdQqGg",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
+                voice="v_CRDRkwuwboYz",#"v_ckr9NXBNDLXy","v_VeRxYTHdQqGg",
                 extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "normal"},
             ),
 
             inference.TTS(
                 model="fishaudio/s2-pro",
-                voice="v_E8hZCwkMtY7y",#"v_ckr9NXBNDLXy",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
+                voice="v_CRDRkwuwboYz",#"v_ckr9NXBNDLXy","v_VeRxYTHdQqGg",
                 extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "normal"},
             ),
 
