@@ -461,16 +461,20 @@ async def get_customer_info(ctx: RunContext, phone_number: str) -> str:
 @function_tool(
     description=(
         "Switch the language you speak in for the rest of the call. Pass "
-        "'english' or 'swahili'. Call this once, immediately after you "
-        "determine which language the customer is using from their first "
-        "substantive response, per the Language Selection Rule — before "
-        "that, you are already speaking English by default, so there is no "
-        "need to call this if the customer's first response is in English. "
-        "Call it again only if the customer explicitly asks you to switch "
-        "language mid-call. This does not change what you understand — you "
-        "always understand English, Swahili, and Sheng regardless of which "
-        "language is currently active — it only changes which language your "
-        "own voice speaks in."
+        "'english' or 'swahili'. You are already speaking Swahili by "
+        "default from the start of every call, per the Language Selection "
+        "Rule — do not call this tool just because the customer responded "
+        "in Swahili, Sheng, or a mix; that is already the default and needs "
+        "no action. Call this with 'english' only when the customer "
+        "explicitly and unambiguously asks you to switch to English (e.g. "
+        "'Can you speak English?') — an explicit request is the only "
+        "trigger, never inferred from the language they happen to speak. "
+        "If a customer you already switched to English later explicitly "
+        "asks to go back to Swahili, call this with 'swahili' once. This "
+        "does not change what you understand — you always understand "
+        "English, Swahili, and Sheng regardless of which language is "
+        "currently active — it only changes which language your own voice "
+        "speaks in."
     )
 )
 async def set_active_language(ctx: RunContext, language: str) -> str:
@@ -1020,10 +1024,15 @@ async def entrypoint(ctx: JobContext):
         prompt's Language Selection Rule), and Sheng renders as a rough
         mix of the two either way, there is no real call where auto-detect's
         wider net helps — it only adds a failure mode neither engine needs.
-        Pinning to English before the customer's language is known (see
-        `stt` below) still lets Swahili/Sheng speech through as workable,
-        if imperfect, transcription — the same tradeoff already accepted
-        for TTS defaulting to English at call start.
+        The conversation itself pins to Swahili by default (see
+        `session_stt` below), matching the Language Selection Rule's
+        Swahili-first default — English speech still comes through as
+        workable, if imperfect, transcription on that pinning, the same
+        tradeoff previously accepted the other way around. AMD's own `stt`
+        (used only for voicemail/IVR detection, not the conversation)
+        stays pinned to English separately, since real voicemail/IVR menu
+        prompts are consistently in English regardless of which language
+        the conversation itself defaults to.
         """
         return agents_stt.FallbackAdapter(
             [
@@ -1071,11 +1080,17 @@ async def entrypoint(ctx: JobContext):
         "english": build_stt_for_language("en"),
         "swahili": build_stt_for_language("sw"),
     }
-    # Every call opens in English per the Language Selection Rule — the
-    # model hasn't heard the customer speak yet, so there's nothing to
-    # match. Also used for AMD below, which mostly needs to read English
-    # voicemail/IVR menu prompts ("Press one to save...").
+    # AMD-only: kept pinned to English regardless of the conversation's own
+    # default below, since real call data shows voicemail/IVR menu prompts
+    # ("Press one to save...") are consistently in English -- unrelated to
+    # which language we open the actual conversation in.
     stt = stt_by_language["english"]
+    # The conversation itself now opens in Swahili by default per the
+    # Language Selection Rule -- see set_active_language and the Opening
+    # the Call section. Kept separate from `stt` above so AMD's own
+    # English-pinned STT (for voicemail/IVR detection) isn't affected by
+    # this default.
+    session_stt = stt_by_language["swahili"]
 
     # LLM: Gemini 3.1 Flash-Lite as primary, gpt-5-mini as fallback if
     # Gemini errors out. Worth knowing: Gemini 2.5 (Flash and Flash-Lite) has
@@ -1151,15 +1166,16 @@ async def entrypoint(ctx: JobContext):
             max_retry_per_tts=0,
         ),
     }
-    # Every call opens in English per the Language Selection Rule — the
-    # model hasn't heard the customer speak yet, so there's nothing to match.
-    tts = tts_by_language["english"]
+    # Every call opens in Swahili by default per the Language Selection
+    # Rule -- see set_active_language's docstring for why the default
+    # flipped from English.
+    tts = tts_by_language["swahili"]
 
 
 
     # Session
     session = AgentSession(
-        stt=stt,
+        stt=session_stt,
         llm=llm,
         vad=vad,
         tts=tts,
@@ -1234,10 +1250,18 @@ async def entrypoint(ctx: JobContext):
 
     async def _end_call_for_hearing_difficulty() -> None:
         try:
-            await session.say(
-                "It seems we're having trouble hearing each other — I'll try you again another time.",
-                allow_interruptions=False,
+            # Bypasses the LLM, so — same issue as the other hardcoded
+            # safety-net lines — it wouldn't otherwise know the call's
+            # active language. Was hardcoded English-only before the
+            # Swahili-default change; now wrong on most calls if left as-is.
+            active_language = session.userdata.get("active_language", "swahili")
+            closing_line = (
+                "Inaonekana tunapata shida kusikizana — nitajaribu "
+                "kukupigia tena baadaye."
+                if active_language == "swahili"
+                else "It seems we're having trouble hearing each other — I'll try you again another time."
             )
+            await session.say(closing_line, allow_interruptions=False)
         except Exception as e:
             print(f"Failed to speak hearing-difficulty backstop closing line: {e}")
         ctx.shutdown(reason="hearing-difficulty backstop: repeated greeting-only exchanges")
@@ -1424,8 +1448,10 @@ async def entrypoint(ctx: JobContext):
             # active language on its own — a real Kenya test call showed
             # this spoken in English mid-Swahili-conversation, confusing
             # the caller. Read the language set_active_language last
-            # switched to (ctx.userdata) instead of hardcoding English.
-            active_language = session.userdata.get("active_language", "english")
+            # switched to (ctx.userdata) instead of hardcoding a default.
+            # Falls back to swahili, not english, matching the call's own
+            # default before any explicit switch has happened.
+            active_language = session.userdata.get("active_language", "swahili")
             checkin_line = (
                 "Uko pale?" if active_language == "swahili" else "Are you still with me?"
             )
@@ -1600,9 +1626,10 @@ async def entrypoint(ctx: JobContext):
             return  # call already ended for some other reason
         try:
             # Bypasses the LLM, so — same issue as the silence check-in
-            # above — it wouldn't otherwise know the call had switched to
-            # Swahili. Machine-translated; worth a native-speaker check.
-            active_language = session.userdata.get("active_language", "english")
+            # above — it wouldn't otherwise know the call had switched
+            # language. Machine-translated; worth a native-speaker check.
+            # Falls back to swahili, matching the call's own default.
+            active_language = session.userdata.get("active_language", "swahili")
             closing_line = (
                 "Muda wa simu hii umefika mwisho, kwa hivyo nitahitaji "
                 "kuondoka sasa. Asante."
@@ -1635,7 +1662,7 @@ async def entrypoint(ctx: JobContext):
         result = None
         call_state["amd_category"] = "skipped_console"
         await session.say(
-            "Hello, how can I assist you with your account today?",
+            "Habari, nawezaje kukusaidia na akaunti yako leo?",
             allow_interruptions=True,
         )
     else:
