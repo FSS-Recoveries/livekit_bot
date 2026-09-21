@@ -781,6 +781,11 @@ HMM_FILLER_DELAY_SECONDS = 3
 # How long to wait after the "Are you still with me?" check-in before
 # giving up and hanging up, if the caller still hasn't responded.
 SILENCE_SHUTDOWN_DELAY_SECONDS = 10
+# Absolute ceiling on how long a call can be held open by content-free
+# noise after the check-in has already fired once — see
+# _force_shutdown_after_extended_silence's docstring below for why this
+# exists alongside SILENCE_SHUTDOWN_DELAY_SECONDS rather than replacing it.
+SILENCE_HARD_CAP_SECONDS = 40
 
 
 async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
@@ -857,6 +862,7 @@ async def entrypoint(ctx: JobContext):
     opening_stall_task: asyncio.Task | None = None
     hmm_filler_task: asyncio.Task | None = None
     silence_shutdown_task: asyncio.Task | None = None
+    silence_hard_cap_task: asyncio.Task | None = None
 
     async def _on_shutdown():
         # ctx.shutdown() (used everywhere we decide to end the call) only
@@ -882,6 +888,8 @@ async def entrypoint(ctx: JobContext):
             hmm_filler_task.cancel()
         if silence_shutdown_task is not None:
             silence_shutdown_task.cancel()
+        if silence_hard_cap_task is not None:
+            silence_hard_cap_task.cancel()
 
         egress_info = await egress_task
         recording_url = await _finish_call_recording(ctx, egress_info)
@@ -1350,13 +1358,18 @@ async def entrypoint(ctx: JobContext):
     checked_in = False
 
     def _cancel_pending_silence_shutdown() -> None:
-        nonlocal checked_in, silence_shutdown_task
+        nonlocal checked_in, silence_shutdown_task, silence_hard_cap_task
         checked_in = False
         if silence_shutdown_task is not None and not silence_shutdown_task.done():
             silence_shutdown_task.cancel()
+        # Confirmed real content -- the call is genuinely alive, so the hard
+        # cap below (armed when the check-in first fired) no longer applies
+        # either. It gets re-armed the next time checked_in goes True again.
+        if silence_hard_cap_task is not None and not silence_hard_cap_task.done():
+            silence_hard_cap_task.cancel()
 
     def _on_user_state_changed(ev):
-        nonlocal checked_in, silence_shutdown_task
+        nonlocal checked_in, silence_shutdown_task, silence_hard_cap_task
         # Diagnostic logging (STT/turn-detection reliability investigation,
         # Aug 2026) — every VAD-level state transition, to correlate against
         # actual speech timing from the call recording.
@@ -1417,6 +1430,11 @@ async def entrypoint(ctx: JobContext):
                 "Uko pale?" if active_language == "swahili" else "Are you still with me?"
             )
             session.say(checkin_line, allow_interruptions=True)
+            # Armed once, the first time the check-in fires — not re-armed
+            # on every away entry like silence_shutdown_task below, since
+            # it's an absolute ceiling from the check-in, not a per-blip
+            # countdown. See _force_shutdown_after_extended_silence.
+            silence_hard_cap_task = asyncio.create_task(_force_shutdown_after_extended_silence())
         # Re-arm the hang-up countdown on every away entry, even a repeat
         # one following a blip above — just without saying the check-in
         # line again, so an echo/noise blip loop can no longer spam it.
@@ -1425,6 +1443,30 @@ async def entrypoint(ctx: JobContext):
     async def _shutdown_after_silence() -> None:
         await asyncio.sleep(SILENCE_SHUTDOWN_DELAY_SECONDS)
         ctx.shutdown(reason="no response after silence check")
+
+    async def _force_shutdown_after_extended_silence() -> None:
+        """Absolute ceiling on top of _shutdown_after_silence's per-blip
+        countdown: real call data showed a meaningful tail of calls (up to
+        ~267s, some presumably running to the full call-length cap) where
+        the customer never says anything at all, yet the short 10s hang-up
+        countdown above never gets to run to completion. Root cause: its
+        countdown is cancelled by _on_user_state_changed's "speaking"
+        branch on ANY VAD-detected speech onset -- including a content-free
+        blip that never produces a real transcript (background noise, a
+        stray sound) -- and gets re-armed fresh on every subsequent "away"
+        entry. A line producing such blips more often than every 10s can
+        defer the short countdown indefinitely without ever saying anything
+        real, since that branch has no way to distinguish "genuinely still
+        talking" from "just noisy" at the point it fires.
+
+        This task is deliberately NOT cancelled by that same "speaking"
+        branch — only by _cancel_pending_silence_shutdown, which only runs
+        on a final transcript with actual non-blank content (confirmed real
+        engagement). So unlike the short countdown, blips alone can't keep
+        pushing this one back indefinitely.
+        """
+        await asyncio.sleep(SILENCE_HARD_CAP_SECONDS)
+        ctx.shutdown(reason="no real response after extended silence (hard cap)")
 
     def _on_user_input_transcribed(ev) -> None:
         # Diagnostic logging (STT/turn-detection reliability investigation,
