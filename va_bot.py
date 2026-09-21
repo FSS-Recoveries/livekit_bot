@@ -15,11 +15,11 @@ from dotenv import load_dotenv
 from livekit import rtc
 from livekit import api as lk_api
 from livekit.agents import (
+    AgentServer,
     AgentSession,
     Agent,
     RoomInputOptions,
     JobContext,
-    WorkerOptions,
     cli,
     function_tool,
     RunContext,
@@ -86,6 +86,10 @@ load_dotenv(".env.local")
 # Map ELEVENLABS_API_KEY -> ELEVEN_API_KEY for plugin compatibility
 if not os.getenv("ELEVEN_API_KEY") and os.getenv("ELEVENLABS_API_KEY"):
     os.environ["ELEVEN_API_KEY"] = os.getenv("ELEVENLABS_API_KEY")
+
+# When true, skip writing call records to Firestore (see _save_call_record)
+# so test calls don't pollute the live_kit_bot_calls collection.
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes", "y"}
 
 # ── Firebase (call recordings + call records) ────────────────────────────
 FIREBASE_SERVICE_ACCOUNT_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "service_account.json")
@@ -332,6 +336,9 @@ def _save_call_record(
     if _firebase_app is None:
         return
     usage, total_estimated_cost_usd = _add_estimated_costs(usage)
+    if DRY_RUN:
+        print(f"[DRY_RUN] Would save call record for room {room_name} to Firestore.")
+        return
     try:
         db = fb_firestore.client()
         db.collection(CALLS_COLLECTION).document(room_name).set(
@@ -960,13 +967,13 @@ async def entrypoint(ctx: JobContext):
             inference.TTS(
                 model="fishaudio/s2.1-pro",
                 voice="v_E8hZCwkMtY7y",#"v_VeRxYTHdQqGg",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-                extra_kwargs={"speed": 1.25, "temperature": 0, "latency": "normal"},
+                extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "normal"},
             ),
 
             inference.TTS(
                 model="fishaudio/s2-pro",
                 voice="v_E8hZCwkMtY7y",#"v_ckr9NXBNDLXy",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-                extra_kwargs={"speed": 1.25, "temperature": 0, "latency": "normal"},
+                extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "normal"},
             ),
 
             #inference.TTS(
@@ -1422,6 +1429,21 @@ def prewarm(proc):
     proc.userdata["vad"] = silero.VAD.load()
 
 
+# Module-level AgentServer: `lk agent start`/`lk agent deploy` import this
+# file and look for an AgentServer instance at module scope (preferably
+# named `server`) rather than executing it as a script — they never reach
+# the `if __name__ == "__main__":` block below, so the entrypoint/prewarm
+# registration has to happen here, unconditionally, on import.
+#
+# agent_name="Mary" is required because the SIP dispatch rule
+# (roomConfig.agents: [{"agentName": "Mary"}]) uses explicit/named
+# dispatch. Without a matching agent_name here, this worker only registers
+# for automatic dispatch and never receives jobs from that rule — the
+# dispatch name below must match the dispatch rule exactly.
+server = AgentServer(setup_fnc=prewarm)
+server.rtc_session(entrypoint, agent_name="Mary")
+
+
 if __name__ == "__main__":
     # STT and LLM run through LiveKit Inference, billed via your LiveKit
     # Cloud account — no DEEPGRAM_API_KEY/GOOGLE_API_KEY/OPENAI_API_KEY
@@ -1432,12 +1454,4 @@ if __name__ == "__main__":
     # LIVEKIT_API_KEY/LIVEKIT_API_SECRET + AZURE_SPEECH_KEY/
     # AZURE_SPEECH_REGION + ELEVENLABS_API_KEY (+ Firebase creds for call
     # recording, unrelated to voice AI billing).
-    #
-    # agent_name="Mary" is required because the SIP dispatch rule
-    # (roomConfig.agents: [{"agentName": "Mary"}]) uses explicit/named
-    # dispatch. Without a matching agent_name here, this worker only
-    # registers for automatic dispatch and never receives jobs from that
-    # rule — the dispatch name below must match the dispatch rule exactly.
-    cli.run_app(
-        WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, agent_name="Mary")
-    )
+    cli.run_app(server)
