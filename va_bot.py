@@ -213,21 +213,23 @@ async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
 # LLM rates and the Fish Audio TTS rate were confirmed identical on both as
 # of the same date.
 #
-# The `provider`/`model` strings these usage entries actually contain once
-# routed through the gateway haven't all been individually confirmed against
-# a real call (see per-model notes below) — matching may still silently
-# return None for an entry if a provider string differs from what's assumed.
+# The `provider`/`model` strings below were confirmed against real usage
+# entries pulled from Firestore (2026-09): every model routed through
+# LiveKit Inference reports provider="livekit" regardless of the underlying
+# vendor, and `model` is the fully-qualified "vendor/model" string (e.g.
+# "google/gemini-3.1-flash-lite", "deepgram/nova-3", "openai/gpt-5-mini") —
+# not the bare model name. The original guesses below (bare model names for
+# Gemini, and provider=="Deepgram"/"api.openai.com" for Deepgram/GPT-5-mini)
+# never matched a single real entry: Deepgram (used on ~99% of calls) and
+# Gemini (used on ~92% of calls) — the two highest-volume components — were
+# silently costed at $0 for every call until this was caught by auditing
+# real usage data against total_estimated_cost_usd. Match on `model` alone
+# for every LiveKit-Inference-routed model; only ElevenLabs' direct plugin
+# (not Inference) reports its own real provider string ("ElevenLabs").
 # Azure isn't priced here at all: its plugin doesn't report
 # model_provider/model_name metadata the way the others do, so it hasn't
 # been confirmed against a real usage entry to know the exact keys it would
 # use (even though it's currently unused as a fallback — see build_azure_tts).
-#
-# Gemini 3.1 Flash-Lite is matched on `model` alone (no `provider` check,
-# unlike the OpenAI/ElevenLabs/Deepgram entries below) — the exact
-# `provider` string the Google plugin reports for its usage metrics hasn't
-# been confirmed against a real call. If estimated_cost_usd comes back None
-# for Gemini usage entries, check a real usage dict's `provider` value and
-# add that condition back for a tighter match.
 _GEMINI_FLASH_LITE_INPUT_PER_TOKEN = 0.25 / 1_000_000
 _GEMINI_FLASH_LITE_CACHED_INPUT_PER_TOKEN = 0.025 / 1_000_000
 _GEMINI_FLASH_LITE_OUTPUT_PER_TOKEN = 1.50 / 1_000_000  # includes thinking tokens
@@ -253,6 +255,11 @@ _DEEPGRAM_NOVA3_PER_SECOND = 0.0048 / 60
 # `model` alone, same reasoning as Gemini above — the `provider` string
 # these entries report hasn't been confirmed against a real usage entry.
 _FISHAUDIO_S21PRO_PER_CHARACTER = 15.00 / 1_000_000
+# fishaudio/s2-pro (the in-list TTS fallback below s2.1-pro) had no rate
+# entry at all before this — always fell through to `return None`. No
+# separate published rate found for s2-pro vs s2.1-pro; reusing the
+# s2.1-pro rate is an approximation until a distinct one is confirmed.
+_FISHAUDIO_S2PRO_PER_CHARACTER = _FISHAUDIO_S21PRO_PER_CHARACTER
 _INWORLD_TTS_15_MAX_PER_CHARACTER = 35.00 / 1_000_000
 # AssemblyAI Universal-Streaming-Multilingual (third STT fallback): $0.0025/min,
 # the cheapest STT on LiveKit's Inference rate card. Matched on `model`
@@ -268,7 +275,7 @@ _GROK_4_1_FAST_OUTPUT_PER_TOKEN = 0.50 / 1_000_000
 
 def _estimate_entry_cost(entry: dict) -> float | None:
     provider, model = entry.get("provider"), entry.get("model")
-    if model == "gemini-3.1-flash-lite":
+    if model == "google/gemini-3.1-flash-lite":
         # input_tokens already includes input_cached_tokens as a subset —
         # only the non-cached remainder is billed at the full input rate.
         cached = entry.get("input_cached_tokens", 0)
@@ -278,7 +285,7 @@ def _estimate_entry_cost(entry: dict) -> float | None:
             + cached * _GEMINI_FLASH_LITE_CACHED_INPUT_PER_TOKEN
             + entry.get("output_tokens", 0) * _GEMINI_FLASH_LITE_OUTPUT_PER_TOKEN
         )
-    if provider == "api.openai.com" and model == "gpt-5-mini":
+    if model == "openai/gpt-5-mini":
         cached = entry.get("input_cached_tokens", 0)
         uncached = max(entry.get("input_tokens", 0) - cached, 0)
         return (
@@ -290,10 +297,12 @@ def _estimate_entry_cost(entry: dict) -> float | None:
         return entry.get("characters_count", 0) * _ELEVENLABS_FLASH_PER_CHARACTER
     if model == "elevenlabs/scribe_v2_realtime":
         return entry.get("audio_duration", 0) * _ELEVENLABS_SCRIBE_V2_REALTIME_PER_SECOND
-    if provider == "Deepgram" and model == "nova-3":
+    if model == "deepgram/nova-3":
         return entry.get("audio_duration", 0) * _DEEPGRAM_NOVA3_PER_SECOND
     if model == "fishaudio/s2.1-pro":
         return entry.get("characters_count", 0) * _FISHAUDIO_S21PRO_PER_CHARACTER
+    if model == "fishaudio/s2-pro":
+        return entry.get("characters_count", 0) * _FISHAUDIO_S2PRO_PER_CHARACTER
     if model == "inworld/inworld-tts-1.5-max":
         return entry.get("characters_count", 0) * _INWORLD_TTS_15_MAX_PER_CHARACTER
     if model == "assemblyai/universal-streaming-multilingual":
@@ -725,6 +734,16 @@ HMM_FILLER_DELAY_SECONDS = 3
 # How long to wait after the "Are you still with me?" check-in before
 # giving up and hanging up, if the caller still hasn't responded.
 SILENCE_SHUTDOWN_DELAY_SECONDS = 12
+# Hard ceiling on "Are you still with me?" check-ins per call, matching the
+# prompt's own "wait, then check in — if no response to a SECOND check,
+# hang up" language (see prompt.txt, "When There Is Silence"). Enforced in
+# code (see _on_user_state_changed below) because VAD alone isn't a
+# trustworthy "the caller is really there" signal: background line noise on
+# a bad connection can trip the "speaking" state without any real content
+# ever being transcribed, which used to re-arm the check-in indefinitely —
+# real calls were observed repeating this line 5-9+ times over several
+# minutes of dead air before ever hanging up.
+MAX_SILENCE_CHECKINS = 2
 
 
 async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
@@ -966,13 +985,13 @@ async def entrypoint(ctx: JobContext):
         [
             inference.TTS(
                 model="fishaudio/s2.1-pro",
-                voice="v_CRDRkwuwboYz",#"v_ckr9NXBNDLXy","v_VeRxYTHdQqGg",
+                voice="v_HZzUP7a6wqSZ"#"v_CRDRkwuwboYz",#"v_ckr9NXBNDLXy",#"v_VeRxYTHdQqGg",
                 extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "normal"},
             ),
 
             inference.TTS(
                 model="fishaudio/s2-pro",
-                voice="v_CRDRkwuwboYz",#"v_ckr9NXBNDLXy","v_VeRxYTHdQqGg",
+                voice="v_HZzUP7a6wqSZ"#"v_CRDRkwuwboYz",#"v_ckr9NXBNDLXy",#"v_VeRxYTHdQqGg",
                 extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "normal"},
             ),
 
@@ -1160,6 +1179,14 @@ async def entrypoint(ctx: JobContext):
     # greeting/AMD window too — session.say() below simply queues until AMD
     # releases that lock if this fires mid-detection.
     checked_in = False
+    # Counts "Are you still with me?" check-ins since the last CONFIRMED
+    # (transcribed, non-blank) sign the caller is there — deliberately
+    # separate from `checked_in`, which the "speaking" VAD transition below
+    # resets on unconfirmed noise alone. Only _on_user_input_transcribed
+    # (real content) resets this counter, so it's what actually bounds the
+    # loop once MAX_SILENCE_CHECKINS is hit, regardless of how many times
+    # line noise fools VAD into "speaking" in between.
+    silence_checkin_count = 0
 
     def _cancel_pending_silence_shutdown() -> None:
         nonlocal checked_in, silence_shutdown_task
@@ -1168,13 +1195,18 @@ async def entrypoint(ctx: JobContext):
             silence_shutdown_task.cancel()
 
     def _on_user_state_changed(ev):
-        nonlocal checked_in, silence_shutdown_task
+        nonlocal checked_in, silence_shutdown_task, silence_checkin_count
         if ev.new_state == "speaking":
             # Unambiguous real speech (VAD-confirmed, not just a stray final
             # transcript) — safe to cancel here directly rather than waiting
             # on _on_user_input_transcribed, which can lag several seconds
             # behind the STT provider (e.g. mid-fallover on the STT
-            # FallbackAdapter).
+            # FallbackAdapter). Deliberately does NOT reset
+            # silence_checkin_count: VAD alone (background noise/static) is
+            # not proof the caller is really there, so it can cancel an
+            # in-flight hang-up countdown but must not re-arm the full
+            # MAX_SILENCE_CHECKINS budget — only confirmed transcribed
+            # content does that, in _on_user_input_transcribed below.
             _cancel_pending_silence_shutdown()
             return
         if ev.new_state != "away":
@@ -1188,6 +1220,17 @@ async def entrypoint(ctx: JobContext):
             return
         if not checked_in:
             checked_in = True
+            if silence_checkin_count >= MAX_SILENCE_CHECKINS:
+                # Already checked in MAX_SILENCE_CHECKINS times with no
+                # confirmed response since — mirrors the prompt's own "no
+                # response to a second check" instruction. Stop asking and
+                # end the call now rather than re-arming another round,
+                # which is what let real calls loop this line 5-9+ times
+                # over minutes of dead air when noise kept tripping
+                # "speaking" without ever producing real content.
+                ctx.shutdown(reason="no response after max silence check-ins")
+                return
+            silence_checkin_count += 1
             # session.say() returns a SpeechHandle (already queued/running,
             # not a coroutine) — wrapping it in asyncio.create_task() raises
             # TypeError, so it's called directly, fire-and-forget.
@@ -1199,6 +1242,7 @@ async def entrypoint(ctx: JobContext):
         ctx.shutdown(reason="no response after silence check")
 
     def _on_user_input_transcribed(ev) -> None:
+        nonlocal silence_checkin_count
         # A real call showed the bot repeating "Are you still with me?"
         # three times over ~5 minutes without ever hanging up: background
         # line noise kept producing stray *final* transcripts (sometimes
@@ -1210,6 +1254,7 @@ async def entrypoint(ctx: JobContext):
         # really there.
         if ev.is_final and ev.transcript.strip():
             _cancel_pending_silence_shutdown()
+            silence_checkin_count = 0
 
     session.on("user_state_changed", _on_user_state_changed)
     session.on("user_input_transcribed", _on_user_input_transcribed)
