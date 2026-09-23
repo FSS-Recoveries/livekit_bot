@@ -933,9 +933,10 @@ async def entrypoint(ctx: JobContext):
     # minimal cost, just not the fastest option.
     stt = agents_stt.FallbackAdapter(
         [
+            inference.STT("elevenlabs/scribe_v2_realtime", language="en"),
             inference.STT("deepgram/nova-3", language="en"),
             inference.STT("assemblyai/universal-streaming-multilingual", language="en"),
-            inference.STT("elevenlabs/scribe_v2_realtime", language="en"),
+            
         ]
     )
     # LLM: Gemini 3.1 Flash-Lite as primary, gpt-5-mini as fallback if
