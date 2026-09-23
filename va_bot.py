@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import os
+import random
 import re
 import requests
 import inspect
@@ -341,6 +342,7 @@ def _save_call_record(
     duration_seconds: float,
     usage: list,
     phone_number: str | None,
+    fallback_variants: dict | None = None,
 ) -> None:
     if _firebase_app is None:
         return
@@ -361,6 +363,10 @@ def _save_call_record(
                 "duration_seconds": round(duration_seconds, 1),
                 "usage": usage,
                 "total_estimated_cost_usd": total_estimated_cost_usd,
+                # Which A/B provider-order variant was picked for each
+                # FallbackAdapter this call, e.g. {"stt": "A", "llm": "B",
+                # "tts": "A"} — for comparing outcomes across variants.
+                "fallback_variants": fallback_variants,
                 "ended_at": fb_firestore.SERVER_TIMESTAMP,
                 # Picked up by the separate livekit_pipeline.py batch script
                 # (AI extraction, institution lookup, call_notes upserts,
@@ -791,6 +797,73 @@ async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
             await room.local_participant.unpublish_track(publication.sid)
 
 
+# ── FallbackAdapter A/B variants ────────────────────────────────────────
+# Two candidate provider orderings per adapter (STT/LLM/TTS), randomly
+# assigned per call via _pick_fallback_variants() so outcomes can be
+# compared across the two. "A" is the pre-existing fixed ordering; "B"
+# swaps which provider is primary vs. first fallback. Built fresh per call
+# (not module-level instances) since entrypoint() already constructs the
+# adapters fresh for every job.
+def _build_stt_variant(name: str):
+    if name == "B":
+        return [
+            inference.STT("deepgram/nova-3", language="en"),
+            inference.STT("assemblyai/universal-streaming-multilingual", language="en"),
+            inference.STT("elevenlabs/scribe_v2_realtime", language="en"),
+        ]
+    return [
+        inference.STT("elevenlabs/scribe_v2_realtime", language="en"),
+        inference.STT("deepgram/nova-3", language="en"),
+        inference.STT("assemblyai/universal-streaming-multilingual", language="en"),
+    ]
+
+
+def _build_llm_variant(name: str):
+    if name == "B":
+        return [
+            inference.LLM("openai/gpt-5-mini"),
+            inference.LLM("google/gemini-3.1-flash-lite"),
+            inference.LLM("xai/grok-4-1-fast-non-reasoning"),
+        ]
+    return [
+        inference.LLM("google/gemini-3.1-flash-lite"),
+        inference.LLM("openai/gpt-5-mini"),
+        inference.LLM("xai/grok-4-1-fast-non-reasoning"),
+    ]
+
+
+def _build_tts_variant(name: str):
+    if name == "B":
+        return [
+            inference.TTS(
+                model="fishaudio/s2-pro",
+                voice="v_ckr9NXBNDLXy",
+                extra_kwargs={"speed": 1.25, "temperature": 0, "latency": "normal"},
+            ),
+            inference.TTS(
+                model="fishaudio/s2.1-pro",
+                voice="v_ckr9NXBNDLXy",
+                extra_kwargs={"speed": 1.25, "temperature": 0, "latency": "normal"},
+            ),
+        ]
+    return [
+        inference.TTS(
+            model="fishaudio/s2.1-pro",
+            voice="v_HZzUP7a6wqSZ",
+            extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "normal"},
+        ),
+        inference.TTS(
+            model="fishaudio/s2-pro",
+            voice="v_HZzUP7a6wqSZ",
+            extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "normal"},
+        ),
+    ]
+
+
+def _pick_fallback_variants() -> dict:
+    return {k: random.choice(("A", "B")) for k in ("stt", "llm", "tts")}
+
+
 # ── Entrypoint ──────────────────────────────────────────────────────────
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
@@ -806,6 +879,9 @@ async def entrypoint(ctx: JobContext):
     # in _on_shutdown.
     call_started_at = time.time()
     call_state = {"amd_category": None}
+    # A/B provider-order variant per FallbackAdapter, picked once per call
+    # and recorded on the call's Firestore doc (see _save_call_record).
+    fallback_variants = _pick_fallback_variants()
     transcript_lines: list[str] = []
     egress_task = asyncio.create_task(_start_call_recording(ctx))
     max_duration_task: asyncio.Task | None = None
@@ -850,6 +926,7 @@ async def entrypoint(ctx: JobContext):
             time.time() - call_started_at,
             usage,
             phone_number,
+            fallback_variants,
         )
 
     ctx.add_shutdown_callback(_on_shutdown)
@@ -931,14 +1008,12 @@ async def entrypoint(ctx: JobContext):
     # ($0.0025/min, the lowest on LiveKit's STT rate card) rather than being
     # dropped — if Deepgram errors out mid-call, still-decent accuracy at
     # minimal cost, just not the fastest option.
-    stt = agents_stt.FallbackAdapter(
-        [
-            inference.STT("elevenlabs/scribe_v2_realtime", language="en"),
-            inference.STT("deepgram/nova-3", language="en"),
-            inference.STT("assemblyai/universal-streaming-multilingual", language="en"),
-            
-        ]
-    )
+    #
+    # Ordering is one of two A/B variants picked at call start by
+    # _pick_fallback_variants() (see fallback_variants above) — variant "A"
+    # is the ordering described above, "B" swaps Deepgram and ElevenLabs to
+    # compare which one performs better as primary. See _build_stt_variant.
+    stt = agents_stt.FallbackAdapter(_build_stt_variant(fallback_variants["stt"]))
     # LLM: Gemini 3.1 Flash-Lite as primary, gpt-5-mini as fallback if
     # Gemini errors out. Worth knowing: Gemini 2.5 (Flash and Flash-Lite) has
     # a documented upstream quirk where it can return finish_reason=STOP
@@ -963,13 +1038,12 @@ async def entrypoint(ctx: JobContext):
     # internal chain-of-thought before answering, which only adds latency
     # here — this prompt needs reliable instruction-following and tool
     # calls, not multi-step reasoning.
-    llm = agents_llm.FallbackAdapter(
-        [
-            inference.LLM("google/gemini-3.1-flash-lite"),
-            inference.LLM("openai/gpt-5-mini"),
-            inference.LLM("xai/grok-4-1-fast-non-reasoning"),
-        ]
-    )
+    #
+    # Ordering is one of two A/B variants picked at call start (see
+    # fallback_variants above) — variant "A" is the ordering described
+    # above, "B" swaps Gemini and gpt-5-mini to compare which one performs
+    # better as primary. See _build_llm_variant.
+    llm = agents_llm.FallbackAdapter(_build_llm_variant(fallback_variants["llm"]))
     # Silero VAD runs locally, not through any external provider — it never
     # needed an API key, so it's left as-is (still prewarmed per worker
     # process in prewarm(), not per call).
@@ -982,37 +1056,12 @@ async def entrypoint(ctx: JobContext):
     # commented out here — swap either back in as the 2nd list entry to
     # restore it as a fallback. Note there's currently no active fallback:
     # if Fish Audio errors out mid-call, TTS has nothing to fall back to.
+    #
+    # Ordering is one of two A/B variants picked at call start (see
+    # fallback_variants above) — variant "A" is s2.1-pro primary / s2-pro
+    # fallback as described above, "B" swaps them. See _build_tts_variant.
     tts = agents_tts.FallbackAdapter(
-        [
-            inference.TTS(
-                model="fishaudio/s2.1-pro",
-                voice="v_HZzUP7a6wqSZ",#"v_CRDRkwuwboYz",#"v_ckr9NXBNDLXy",#"v_VeRxYTHdQqGg",
-                extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "normal"},
-            ),
-
-            inference.TTS(
-                model="fishaudio/s2-pro",
-                voice="v_HZzUP7a6wqSZ",#"v_CRDRkwuwboYz",#"v_ckr9NXBNDLXy",#"v_VeRxYTHdQqGg",
-                extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "normal"},
-            ),
-
-            #inference.TTS(
-            #    model="inworld/inworld-tts-1.5-max",
-            #    voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-            #    extra_kwargs={"speaking_rate": 1.35, "temperature": 0, "latency": "normal"},
-            #   ),
-                
-            #build_elevenlabs_tts(),
-
-            #inference.TTS(
-                #model="inworld/inworld-tts-1.5-mini",
-                #voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-                #extra_kwargs={"speaking_rate": 1.3, "temperature": 0, "latency": "normal"},
-                #),
-            #build_azure_tts(),
-            
-            
-        ],
+        _build_tts_variant(fallback_variants["tts"]),
         # 0: on any mid-stream failure, switch to the next TTS immediately
         # instead of retrying the same provider first. Each retry re-opens
         # a fresh stream for the same text; if the failed attempt had
