@@ -838,24 +838,24 @@ def _build_tts_variant(name: str):
             inference.TTS(
                 model="fishaudio/s2-pro",
                 voice="v_ckr9NXBNDLXy",
-                extra_kwargs={"speed": 1.25, "temperature": 0, "latency": "normal"},
+                extra_kwargs={"speed": 1.20, "temperature": 0, "latency": "normal"},
             ),
             inference.TTS(
                 model="fishaudio/s2.1-pro",
                 voice="v_ckr9NXBNDLXy",
-                extra_kwargs={"speed": 1.25, "temperature": 0, "latency": "normal"},
+                extra_kwargs={"speed": 1.20, "temperature": 0, "latency": "normal"},
             ),
         ]
     return [
         inference.TTS(
             model="fishaudio/s2.1-pro",
             voice="v_HZzUP7a6wqSZ",
-            extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "normal"},
+            extra_kwargs={"speed": 1.13, "temperature": 0, "latency": "normal"},
         ),
         inference.TTS(
             model="fishaudio/s2-pro",
             voice="v_HZzUP7a6wqSZ",
-            extra_kwargs={"speed": 1.05, "temperature": 0, "latency": "normal"},
+            extra_kwargs={"speed": 1.13, "temperature": 0, "latency": "normal"},
         ),
     ]
 
