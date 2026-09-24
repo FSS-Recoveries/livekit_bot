@@ -363,9 +363,10 @@ def _save_call_record(
                 "duration_seconds": round(duration_seconds, 1),
                 "usage": usage,
                 "total_estimated_cost_usd": total_estimated_cost_usd,
-                # Which A/B provider-order variant was picked for each
-                # FallbackAdapter this call, e.g. {"stt": "A", "llm": "B",
-                # "tts": "A"} — for comparing outcomes across variants.
+                # Which A/B variant was picked for each of stt/llm/tts
+                # (provider order) and prompt (prompt.txt vs promptB.txt)
+                # this call, e.g. {"stt": "A", "llm": "B", "tts": "A",
+                # "prompt": "B"} — for comparing outcomes across variants.
                 "fallback_variants": fallback_variants,
                 "ended_at": fb_firestore.SERVER_TIMESTAMP,
                 # Picked up by the separate livekit_pipeline.py batch script
@@ -798,12 +799,13 @@ async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
 
 
 # ── FallbackAdapter A/B variants ────────────────────────────────────────
-# Two candidate provider orderings per adapter (STT/LLM/TTS), randomly
-# assigned per call via _pick_fallback_variants() so outcomes can be
-# compared across the two. "A" is the pre-existing fixed ordering; "B"
-# swaps which provider is primary vs. first fallback. Built fresh per call
-# (not module-level instances) since entrypoint() already constructs the
-# adapters fresh for every job.
+# Two candidate provider orderings per adapter (STT/LLM/TTS), plus two
+# candidate system prompts, randomly assigned per call via
+# _pick_fallback_variants() so outcomes can be compared across the two. For
+# STT/LLM/TTS, "A" is the pre-existing fixed ordering and "B" swaps which
+# provider is primary vs. first fallback; for the prompt, "A" is prompt.txt
+# and "B" is promptB.txt. Built fresh per call (not module-level instances)
+# since entrypoint() already constructs the adapters fresh for every job.
 def _build_stt_variant(name: str):
     if name == "B":
         return [
@@ -861,7 +863,11 @@ def _build_tts_variant(name: str):
 
 
 def _pick_fallback_variants() -> dict:
-    return {k: random.choice(("A", "B")) for k in ("stt", "llm", "tts")}
+    return {k: random.choice(("A", "B")) for k in ("stt", "llm", "tts", "prompt")}
+
+
+def _prompt_path_for_variant(name: str) -> str:
+    return os.path.join(os.getcwd(), "promptB.txt" if name == "B" else "prompt.txt")
 
 
 # ── Entrypoint ──────────────────────────────────────────────────────────
@@ -949,8 +955,12 @@ async def entrypoint(ctx: JobContext):
         if phone_number:
             lookup_task = asyncio.create_task(_fetch_customer_snapshot(phone_number))
 
-    # Load system prompt (fallback if file missing)
-    prompt_path = os.path.join(os.getcwd(), "prompt.txt")
+    # Load system prompt (fallback if file missing). Variant picked once per
+    # call by _pick_fallback_variants() above — "A" is prompt.txt, "B" is
+    # promptB.txt — so outcomes can be compared the same way as the
+    # STT/LLM/TTS A/B variants (see fallback_variants on the call's
+    # Firestore doc, written by _save_call_record).
+    prompt_path = _prompt_path_for_variant(fallback_variants["prompt"])
     try:
         with open(prompt_path, "r", encoding="utf-8") as f:
             system_prompt = f.read().strip()
