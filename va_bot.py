@@ -316,11 +316,24 @@ def _estimate_entry_cost(entry: dict) -> float | None:
     return None
 
 
+_BILLED_USAGE_TYPES = {"stt_usage", "llm_usage", "tts_usage"}
+
+
 def _add_estimated_costs(usage: list) -> tuple[list, float]:
     """Annotates each usage entry with an estimated_cost_usd and returns the
     enriched list alongside the total. Entries with no known pricing (e.g.
     Azure TTS, LiveKit's own interruption/turn-detector usage) are left
-    with estimated_cost_usd=None rather than guessed."""
+    with estimated_cost_usd=None rather than guessed.
+
+    Logs a warning for any stt/llm/tts entry that falls through with no
+    rate — those types are always separately billed (unlike
+    interruption/eot usage), so a None there is a real pricing-table gap,
+    not an expected one. This is exactly the failure mode that silently
+    cost Deepgram and Gemini usage at $0 for every call until an audit
+    against total_estimated_cost_usd caught it (see the rate-card comment
+    above _estimate_entry_cost) — logging it here means a newly-added
+    variant model with no rate entry shows up in logs immediately instead
+    of months later."""
     total = 0.0
     enriched = []
     for entry in usage:
@@ -328,6 +341,12 @@ def _add_estimated_costs(usage: list) -> tuple[list, float]:
         cost = _estimate_entry_cost(entry)
         if cost is not None:
             total += cost
+        elif entry.get("type") in _BILLED_USAGE_TYPES:
+            print(
+                f"No cost rate for billed usage entry: type={entry.get('type')} "
+                f"provider={entry.get('provider')} model={entry.get('model')} — "
+                f"add a rate to _estimate_entry_cost, this call's cost is being undercounted."
+            )
         entry["estimated_cost_usd"] = round(cost, 6) if cost is not None else None
         enriched.append(entry)
     return enriched, round(total, 6)
@@ -806,60 +825,64 @@ async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
 # provider is primary vs. first fallback; for the prompt, "A" is prompt.txt
 # and "B" is promptB.txt. Built fresh per call (not module-level instances)
 # since entrypoint() already constructs the adapters fresh for every job.
+#
+# Model lists below are the single source of truth for "which models can a
+# call select" — also consumed by _assert_variant_models_priced() just below
+# so a newly-added variant model can't silently ship with no
+# _estimate_entry_cost() rate the way google/gemini-3.1-flash-lite and
+# deepgram/nova-3 did before the 2026-09 audit (see the rate-card comment
+# above _estimate_entry_cost).
+_STT_VARIANT_MODELS: dict[str, list[str]] = {
+    "A": ["elevenlabs/scribe_v2_realtime", "deepgram/nova-3", "assemblyai/universal-streaming-multilingual"],
+    "B": ["deepgram/nova-3", "assemblyai/universal-streaming-multilingual", "elevenlabs/scribe_v2_realtime"],
+}
+_LLM_VARIANT_MODELS: dict[str, list[str]] = {
+    "A": ["google/gemini-3.1-flash-lite", "openai/gpt-5-mini", "xai/grok-4-1-fast-non-reasoning"],
+    "B": ["openai/gpt-5-mini", "google/gemini-3.1-flash-lite", "xai/grok-4-1-fast-non-reasoning"],
+}
+# (model, voice_id, speed) — voice/speed don't affect price (TTS is billed
+# per character regardless of voice; see _estimate_entry_cost), so only the
+# model half of each tuple feeds _assert_variant_models_priced().
+_TTS_VARIANT_MODELS: dict[str, list[tuple[str, str, float]]] = {
+    "A": [("fishaudio/s2.1-pro", "v_HZzUP7a6wqSZ", 1.15), ("fishaudio/s2-pro", "v_HZzUP7a6wqSZ", 1.15)],
+    "B": [("fishaudio/s2-pro", "v_ckr9NXBNDLXy", 1.20), ("fishaudio/s2.1-pro", "v_ckr9NXBNDLXy", 1.20)],
+}
+
+
 def _build_stt_variant(name: str):
-    if name == "B":
-        return [
-            inference.STT("deepgram/nova-3", language="en"),
-            inference.STT("assemblyai/universal-streaming-multilingual", language="en"),
-            inference.STT("elevenlabs/scribe_v2_realtime", language="en"),
-        ]
-    return [
-        inference.STT("elevenlabs/scribe_v2_realtime", language="en"),
-        inference.STT("deepgram/nova-3", language="en"),
-        inference.STT("assemblyai/universal-streaming-multilingual", language="en"),
-    ]
+    return [inference.STT(model, language="en") for model in _STT_VARIANT_MODELS.get(name, _STT_VARIANT_MODELS["A"])]
 
 
 def _build_llm_variant(name: str):
-    if name == "B":
-        return [
-            inference.LLM("openai/gpt-5-mini"),
-            inference.LLM("google/gemini-3.1-flash-lite"),
-            inference.LLM("xai/grok-4-1-fast-non-reasoning"),
-        ]
-    return [
-        inference.LLM("google/gemini-3.1-flash-lite"),
-        inference.LLM("openai/gpt-5-mini"),
-        inference.LLM("xai/grok-4-1-fast-non-reasoning"),
-    ]
+    return [inference.LLM(model) for model in _LLM_VARIANT_MODELS.get(name, _LLM_VARIANT_MODELS["A"])]
 
 
 def _build_tts_variant(name: str):
-    if name == "B":
-        return [
-            inference.TTS(
-                model="fishaudio/s2-pro",
-                voice="v_ckr9NXBNDLXy",
-                extra_kwargs={"speed": 1.20, "temperature": 0, "latency": "normal"},
-            ),
-            inference.TTS(
-                model="fishaudio/s2.1-pro",
-                voice="v_ckr9NXBNDLXy",
-                extra_kwargs={"speed": 1.20, "temperature": 0, "latency": "normal"},
-            ),
-        ]
     return [
-        inference.TTS(
-            model="fishaudio/s2.1-pro",
-            voice="v_HZzUP7a6wqSZ",
-            extra_kwargs={"speed": 1.15, "temperature": 0, "latency": "normal"},
-        ),
-        inference.TTS(
-            model="fishaudio/s2-pro",
-            voice="v_HZzUP7a6wqSZ",
-            extra_kwargs={"speed": 1.15, "temperature": 0, "latency": "normal"},
-        ),
+        inference.TTS(model=model, voice=voice, extra_kwargs={"speed": speed, "temperature": 0, "latency": "normal"})
+        for model, voice, speed in _TTS_VARIANT_MODELS.get(name, _TTS_VARIANT_MODELS["A"])
     ]
+
+
+def _assert_variant_models_priced() -> None:
+    """Fails fast at import time (before this worker accepts any calls) if
+    any model any A/B variant can select has no _estimate_entry_cost() rate
+    — the same silent-$0-cost failure mode that hit Deepgram/Gemini before
+    the 2026-09 audit (see the rate-card comment above _estimate_entry_cost),
+    except caught immediately instead of discovered weeks later by
+    re-auditing real usage data against total_estimated_cost_usd."""
+    all_models = {m for models in _STT_VARIANT_MODELS.values() for m in models}
+    all_models |= {m for models in _LLM_VARIANT_MODELS.values() for m in models}
+    all_models |= {model for models in _TTS_VARIANT_MODELS.values() for model, _voice, _speed in models}
+    unpriced = sorted(m for m in all_models if _estimate_entry_cost({"model": m}) is None)
+    if unpriced:
+        raise RuntimeError(
+            f"No _estimate_entry_cost() rate for A/B variant model(s): {', '.join(unpriced)} — "
+            f"add a rate before enabling this variant, or every call using it is silently costed at $0."
+        )
+
+
+_assert_variant_models_priced()
 
 
 def _pick_fallback_variants() -> dict:
