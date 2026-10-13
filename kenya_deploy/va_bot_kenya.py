@@ -923,7 +923,19 @@ async def entrypoint(ctx: JobContext):
             print(f"Participant attributes: {dict(sip_participant.attributes)}")
             phone_number = _get_caller_phone_number(sip_participant)
         else:
-            print("Warning: no SIP participant found within timeout")
+            # The phone leg never made it into the room (e.g. the call was
+            # cancelled between Asterisk and LiveKit after the dispatch rule
+            # had already created the room and dispatched us). Carrying on
+            # here used to leave the agent alone in an empty room — greeting
+            # and AMD into nothing, recording dead air, with neither the
+            # silence check-in (needs a linked participant) nor the max-call
+            # cap ever firing — until LiveKit's 300s empty-room timeout
+            # closed it, leaving a silent ~5-minute call record. End the job
+            # now; _on_shutdown deletes the room and still saves the call
+            # record.
+            print("Warning: no SIP participant found within timeout; ending call")
+            ctx.shutdown(reason="no SIP participant joined")
+            return
         print(f"Customer phone number: {phone_number}")
 
         if phone_number:

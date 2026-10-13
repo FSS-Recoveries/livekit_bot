@@ -146,17 +146,28 @@ async def _start_call_recording(ctx: JobContext) -> "lk_api.EgressInfo | None":
         return None
 
 
-async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
-    """Stops egress, waits for the upload to finish, and returns a Firebase download URL."""
-    if egress_info is None or _firebase_app is None:
+def _egress_seconds(info) -> float | None:
+    """Billable egress duration from EgressInfo's started_at/ended_at (Unix
+    nanoseconds; 0 while unset)."""
+    if info is None or not info.started_at or not info.ended_at:
         return None
+    return max(info.ended_at - info.started_at, 0) / 1e9
+
+
+async def _finish_call_recording(ctx: JobContext, egress_info) -> tuple[str | None, float | None]:
+    """Stops egress, waits for the upload to finish, and returns a Firebase
+    download URL plus the egress's billable duration in seconds (None if
+    unknown — the caller falls back to the call's own duration)."""
+    if egress_info is None:
+        return None, None
     try:
         await ctx.api.egress.stop_egress(lk_api.StopEgressRequest(egress_id=egress_info.egress_id))
     except Exception as e:
         print(f"Failed to stop call recording: {e}")
-        return None
+        return None, None
 
     # Egress finalizes and uploads the file asynchronously after stop; poll briefly.
+    info = None
     for _ in range(15):
         await asyncio.sleep(2)
         try:
@@ -165,18 +176,22 @@ async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
             )
         except Exception as e:
             print(f"Failed to poll call recording status: {e}")
-            return None
+            return None, _egress_seconds(info)
         if not resp.items:
-            return None
+            return None, _egress_seconds(info)
         info = resp.items[0]
         if info.status == lk_api.EgressStatus.EGRESS_COMPLETE:
             break
         if info.status in (lk_api.EgressStatus.EGRESS_FAILED, lk_api.EgressStatus.EGRESS_ABORTED):
             print(f"Call recording failed: {info.error}")
-            return None
+            return None, _egress_seconds(info)
     else:
         print("Timed out waiting for call recording to finish uploading.")
-        return None
+        return None, _egress_seconds(info)
+
+    egress_seconds = _egress_seconds(info)
+    if _firebase_app is None:
+        return None, egress_seconds
 
     filepath = f"{RECORDINGS_FOLDER}/{ctx.room.name}.ogg"
     try:
@@ -194,10 +209,10 @@ async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
         return (
             f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_STORAGE_BUCKET}"
             f"/o/{encoded_path}?alt=media&token={token}"
-        )
+        ), egress_seconds
     except Exception as e:
         print(f"Failed to finalize call recording URL: {e}")
-        return None
+        return None, egress_seconds
 
 
 # Rates below are LiveKit's own Inference rate card (Build/Ship plan),
@@ -273,6 +288,27 @@ _ASSEMBLYAI_UNIVERSAL_STREAMING_MULTILINGUAL_PER_SECOND = 0.0025 / 60
 _GROK_4_1_FAST_INPUT_PER_TOKEN = 0.20 / 1_000_000
 _GROK_4_1_FAST_OUTPUT_PER_TOKEN = 0.50 / 1_000_000
 
+# ── LiveKit platform (non-inference) costs ──────────────────────────────
+# Ship-plan overage rates from livekit.com/pricing as of 2026-10-04 (same
+# figures get_session_cost.py uses). Unlike the inference rates above, these
+# aren't reported by ModelUsageCollector at all — _platform_usage_entries()
+# builds them from our own timings and writes them into the same `usage`
+# list as type="platform_usage", so total_estimated_cost_usd and the call
+# monitor pick them up with no separate field to join. Each plan's included
+# monthly quota (Ship: 5,000 agent-session min, 5,000 SIP min, 600
+# transcode min) isn't netted out — these are marginal per-call costs, not
+# the invoice. Scale is cheaper on SIP ($0.003) and egress ($0.004).
+# Not costed: WebRTC participant minutes ($0.0005/min) and downstream
+# bandwidth ($0.12/GB) — both negligible for one audio-only agent per room.
+_LIVEKIT_AGENT_SESSION_PER_SECOND = 0.01 / 60
+_LIVEKIT_THIRD_PARTY_SIP_PER_SECOND = 0.004 / 60
+# Room-composite egress with audio_only=True bills as audio-only transcode.
+_LIVEKIT_EGRESS_AUDIO_PER_SECOND = 0.005 / 60
+# Krisp noise cancellation: BVC / BVCTelephony are Krisp VIVA (voice
+# isolation), billed at $0.0012/min past the plan quota (Ship: 1,000 min) —
+# unlike plain Krisp NC (noise suppression only), which is free on every plan.
+_LIVEKIT_KRISP_VIVA_PER_SECOND = 0.0012 / 60
+
 
 def _estimate_entry_cost(entry: dict) -> float | None:
     provider, model = entry.get("provider"), entry.get("model")
@@ -313,10 +349,49 @@ def _estimate_entry_cost(entry: dict) -> float | None:
             entry.get("input_tokens", 0) * _GROK_4_1_FAST_INPUT_PER_TOKEN
             + entry.get("output_tokens", 0) * _GROK_4_1_FAST_OUTPUT_PER_TOKEN
         )
+    if model == "livekit/agent-session":
+        return entry.get("duration_seconds", 0) * _LIVEKIT_AGENT_SESSION_PER_SECOND
+    if model == "livekit/sip-third-party":
+        return entry.get("duration_seconds", 0) * _LIVEKIT_THIRD_PARTY_SIP_PER_SECOND
+    if model == "livekit/egress-audio":
+        return entry.get("duration_seconds", 0) * _LIVEKIT_EGRESS_AUDIO_PER_SECOND
+    if model in ("livekit/krisp-bvc-telephony", "livekit/krisp-bvc"):
+        return entry.get("duration_seconds", 0) * _LIVEKIT_KRISP_VIVA_PER_SECOND
     return None
 
 
-_BILLED_USAGE_TYPES = {"stt_usage", "llm_usage", "tts_usage"}
+_BILLED_USAGE_TYPES = {"stt_usage", "llm_usage", "tts_usage", "platform_usage"}
+
+
+def _platform_usage_entries(
+    agent_session_seconds: float,
+    sip_seconds: float | None,
+    egress_seconds: float | None,
+    noise_cancellation_seconds: float | None,
+    noise_cancellation_model: str,
+) -> list[dict]:
+    """LiveKit platform line items for one call, shaped like the inference
+    usage entries (type/provider/model) so _add_estimated_costs prices them
+    the same way. A *_seconds of None means that component never ran
+    (console mode has no SIP, recording failed to start, or the call ended
+    before session.start() enabled noise cancellation)."""
+    components = [
+        ("agent_session", "livekit/agent-session", agent_session_seconds),
+        ("sip", "livekit/sip-third-party", sip_seconds),
+        ("egress", "livekit/egress-audio", egress_seconds),
+        ("noise_cancellation", noise_cancellation_model, noise_cancellation_seconds),
+    ]
+    return [
+        {
+            "type": "platform_usage",
+            "provider": "livekit",
+            "model": model,
+            "component": component,
+            "duration_seconds": round(max(seconds, 0.0), 1),
+        }
+        for component, model, seconds in components
+        if seconds is not None
+    ]
 
 
 def _add_estimated_costs(usage: list) -> tuple[list, float]:
@@ -907,11 +982,21 @@ async def entrypoint(ctx: JobContext):
     # Recording doesn't gate any of that; it's only actually needed later,
     # in _on_shutdown.
     call_started_at = time.time()
-    call_state = {"amd_category": None}
+    # sip_joined_at: when our agent first saw the SIP participant (start of
+    # billable SIP minutes, approximately); stays None in console mode.
+    # nc_started_at / nc_model: when (and which) Krisp noise cancellation
+    # was enabled — at session.start(), see below.
+    call_state = {"amd_category": None, "sip_joined_at": None, "nc_started_at": None, "nc_model": "livekit/krisp-bvc"}
     # A/B provider-order variant per FallbackAdapter, picked once per call
     # and recorded on the call's Firestore doc (see _save_call_record).
     fallback_variants = _pick_fallback_variants()
     transcript_lines: list[str] = []
+    # Usage metrics (LLM tokens, TTS characters, STT audio seconds), broken
+    # down per provider/model — persisted to the call's Firestore record.
+    # Created up here, before _on_shutdown is registered, because that
+    # callback reads it — and the no-SIP-participant early exit below can
+    # trigger shutdown before the session setup further down ever runs.
+    usage_collector = ModelUsageCollector()
     egress_task = asyncio.create_task(_start_call_recording(ctx))
     max_duration_task: asyncio.Task | None = None
     opening_stall_task: asyncio.Task | None = None
@@ -919,6 +1004,9 @@ async def entrypoint(ctx: JobContext):
     silence_shutdown_task: asyncio.Task | None = None
 
     async def _on_shutdown():
+        # The call (agent session + SIP leg) ends at the delete_room() just
+        # below — timestamp it before the up-to-~30s recording finalization.
+        call_ended_at = time.time()
         # ctx.shutdown() (used everywhere we decide to end the call) only
         # disconnects our own agent from the room — it does NOT hang up the
         # actual phone call. The SIP participant stays connected with dead
@@ -944,8 +1032,21 @@ async def entrypoint(ctx: JobContext):
             silence_shutdown_task.cancel()
 
         egress_info = await egress_task
-        recording_url = await _finish_call_recording(ctx, egress_info)
+        recording_url, egress_seconds = await _finish_call_recording(ctx, egress_info)
+        if egress_info is not None and egress_seconds is None:
+            # Egress ran but its final timings couldn't be read — it records
+            # the whole room, so the call's own duration is a close stand-in.
+            egress_seconds = call_ended_at - call_started_at
+        sip_joined_at = call_state["sip_joined_at"]
+        nc_started_at = call_state["nc_started_at"]
         usage = [u.model_dump(mode="json") for u in usage_collector.flatten()]
+        usage += _platform_usage_entries(
+            agent_session_seconds=call_ended_at - call_started_at,
+            sip_seconds=call_ended_at - sip_joined_at if sip_joined_at is not None else None,
+            egress_seconds=egress_seconds,
+            noise_cancellation_seconds=call_ended_at - nc_started_at if nc_started_at is not None else None,
+            noise_cancellation_model=call_state["nc_model"],
+        )
         _save_call_record(
             ctx.room.name,
             transcript_lines,
@@ -968,11 +1069,24 @@ async def entrypoint(ctx: JobContext):
     if not is_console:
         sip_participant = await _wait_for_sip_participant(ctx.room)
         if sip_participant:
+            call_state["sip_joined_at"] = time.time()
             print(f"SIP participant joined: {sip_participant.identity}")
             print(f"Participant attributes: {dict(sip_participant.attributes)}")
             phone_number = _get_caller_phone_number(sip_participant)
         else:
-            print("Warning: no SIP participant found within timeout")
+            # The phone leg never made it into the room (e.g. the call was
+            # cancelled between Asterisk and LiveKit after the dispatch rule
+            # had already created the room and dispatched us). Carrying on
+            # here used to leave the agent alone in an empty room — greeting
+            # and AMD into nothing, recording dead air, with neither the
+            # silence check-in (needs a linked participant) nor the 6-min cap
+            # ever firing — until LiveKit's 300s empty-room timeout closed
+            # it: ~10% of all calls, each a silent ~5-minute record. End the
+            # job now; _on_shutdown deletes the room and still saves the
+            # call record.
+            print("Warning: no SIP participant found within timeout; ending call")
+            ctx.shutdown(reason="no SIP participant joined")
+            return
         print(f"Customer phone number: {phone_number}")
 
         if phone_number:
@@ -1106,10 +1220,6 @@ async def entrypoint(ctx: JobContext):
     )
 
 
-
-    # Usage metrics (LLM tokens, TTS characters, STT audio seconds), broken
-    # down per provider/model — persisted to the call's Firestore record.
-    usage_collector = ModelUsageCollector()
 
     # Session
     session = AgentSession(
@@ -1411,6 +1521,8 @@ async def entrypoint(ctx: JobContext):
     noise_cancellation_model = (
         noise_cancellation.BVCTelephony() if sip_participant else noise_cancellation.BVC()
     )
+    call_state["nc_model"] = "livekit/krisp-bvc-telephony" if sip_participant else "livekit/krisp-bvc"
+    call_state["nc_started_at"] = time.time()
     await session.start(
         room=ctx.room,
         agent=agent,
