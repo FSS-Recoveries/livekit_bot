@@ -7,6 +7,7 @@ import inspect
 import time
 import uuid
 import wave
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote as _urlquote
 from zoneinfo import ZoneInfo
@@ -384,6 +385,7 @@ _GREETING_ONLY_PHRASES = {
     "good morning", "good afternoon", "good evening", "good day",
     "who is this", "who is speaking", "who is calling",
     "can you hear me", "are you there",
+    "excuse me", "pardon", "pardon me", "sorry",
 }
 
 
@@ -712,6 +714,50 @@ def build_elevenlabs_tts():
     return elevenlabs.TTS(**tts_kwargs)
 
 
+# ── English loanwords inside Swahili TTS ─────────────────────────────────
+# sw-KE-ZuriNeural is a Swahili-only locale voice — it has no concept of
+# English phonetics, so any English word embedded in an otherwise-Swahili
+# sentence gets sounded out with Swahili pronunciation rules ("SMS" ->
+# "SMIS", "Recoveries" -> "Recohvarees"). Confirmed by direct test: wrapping
+# the offending word in <lang xml:lang="en-KE">...</lang> makes Azure switch
+# to English pronunciation for just that span, without leaving Swahili for
+# the rest of the sentence. Azure's plugin splices input text into its SSML
+# unescaped (azure/tts.py's ChunkedStream._build_ssml), so a literal <lang>
+# tag here passes through as real markup rather than being escaped to text.
+# Extend this list as new mispronounced terms turn up.
+_SWAHILI_TTS_ENGLISH_TERMS = [
+    "SMS", "Recoveries", "Recovery", "FSS", "PTP",
+    "discount", "balance", "penalty", "waiver", "loan", "WhatsApp",
+    "settlement", "branch", "instalment", "installment", "overdue",
+    "interest", "repayment", "paybill", "mobile money", "account", "bank",
+    "default", "Safaricom", "M-Pesa", "Mpesa",
+]
+_SWAHILI_TTS_ENGLISH_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(t) for t in _SWAHILI_TTS_ENGLISH_TERMS) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _tag_english_loanwords(text: str) -> str:
+    return _SWAHILI_TTS_ENGLISH_PATTERN.sub(
+        lambda m: f'<lang xml:lang="en-KE">{m.group(0)}</lang>', text
+    )
+
+
+class _SwahiliAwareAzureTTS(azure.TTS):
+    """Azure TTS that tags known English loanwords before synthesis so the
+    Swahili voice pronounces them correctly instead of sounding them out
+    phonetically. See _SWAHILI_TTS_ENGLISH_TERMS above. Only ever wraps the
+    Swahili voice (see build_azure_tts) — the English voice already
+    pronounces these words correctly and the ElevenLabs fallback never sees
+    this class at all, so a fallback mid-call gets the original, untagged
+    text exactly as before.
+    """
+
+    def synthesize(self, text: str, **kwargs):
+        return super().synthesize(_tag_english_loanwords(text), **kwargs)
+
+
 # ── Azure TTS builder ────────────────────────────────────────────────────
 def build_azure_tts(voice: str | None = None):
     """
@@ -731,7 +777,8 @@ def build_azure_tts(voice: str | None = None):
     works standalone.
     """
     resolved = voice or os.getenv("AZURE_TTS_VOICE", "en-KE-AsiliaNeural")
-    return azure.TTS(voice=resolved)
+    tts_cls = _SwahiliAwareAzureTTS if resolved.startswith("sw-") else azure.TTS
+    return tts_cls(voice=resolved)
 
 
 # ── SIP participant + caller phone number ────────────────────────────────
@@ -790,6 +837,12 @@ SILENCE_SHUTDOWN_DELAY_SECONDS = 10
 # _force_shutdown_after_extended_silence's docstring below for why this
 # exists alongside SILENCE_SHUTDOWN_DELAY_SECONDS rather than replacing it.
 SILENCE_HARD_CAP_SECONDS = 40
+# How long after call_started_at an "away" state with no first response yet
+# is still treated as normal startup latency (AMD's ~20s window, the WAV
+# greeting/bridge clip, customer lookup, first LLM+TTS turn) rather than a
+# customer who never said anything at all — see _on_user_state_changed's
+# first_response_delivered branch below for why this bound exists.
+STARTUP_GRACE_SECONDS = 30
 
 
 async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
@@ -923,7 +976,20 @@ async def entrypoint(ctx: JobContext):
             print(f"Participant attributes: {dict(sip_participant.attributes)}")
             phone_number = _get_caller_phone_number(sip_participant)
         else:
-            print("Warning: no SIP participant found within timeout")
+            # The phone leg never made it into the room (e.g. the call was
+            # cancelled between Asterisk and LiveKit after the dispatch rule
+            # had already created the room and dispatched us). Carrying on
+            # here used to leave the agent alone in an empty room — greeting
+            # and AMD into nothing, recording dead air, with neither the
+            # silence check-in (needs a linked participant) nor the max-call
+            # cap ever firing — until LiveKit's 300s empty-room timeout
+            # closed it, leaving a silent ~5-minute call record. End the job
+            # now; _on_shutdown deletes the room and still saves the call
+            # record. (Ported from OlaOye24's "fixed silent 5m calls" fix to
+            # va_bot.py, commit 57d28db — same bug, same fix, applied here.)
+            print("Warning: no SIP participant found within timeout; ending call")
+            ctx.shutdown(reason="no SIP participant joined")
+            return
         print(f"Customer phone number: {phone_number}")
 
         if phone_number:
@@ -1216,6 +1282,24 @@ async def entrypoint(ctx: JobContext):
         # was cut off in instead of the LLM generating a fresh, similarly-
         # worded reply — this is what actually stops the repeat-loop,
         # rather than just reducing how often it's triggered.
+        #
+        # false_interruption_timeout lowered from 2.0 to 1.5 (TEST, pending
+        # Diana validating on a real call, alongside the VAD change above):
+        # real Kenya transcripts showed sustained choppy/fragmented customer
+        # audio with no single silence gap long enough to hit 2.0s, so the
+        # resume mechanism never got a chance to fire and the LLM kept
+        # generating fresh (differently-worded) restatements instead —
+        # visible as 3 distinct variations of the same opening line in one
+        # call. A shorter window makes it easier to resolve a false
+        # interruption during a choppy gap, at a real tradeoff: a genuine
+        # customer pause mid-thought (gathering a correction or objection)
+        # can run 1.3-1.8s, and if the window expires during that pause,
+        # Shanice resumes her old sentence right as they start the real
+        # point — a new instance of talking over them, not a reduced one.
+        # 1.5 is a deliberately moderate first step, not the most aggressive
+        # value that would help the choppy-audio case — if live calls show
+        # it still cutting off genuine pauses, raise it back toward 2.0
+        # rather than lowering further.
         turn_handling={
             "turn_detection": TurnDetector(),
             "preemptive_generation": {"enabled": True},
@@ -1223,7 +1307,7 @@ async def entrypoint(ctx: JobContext):
                 "mode": "adaptive",
                 "min_words": 2,
                 "resume_false_interruption": True,
-                "false_interruption_timeout": 2.0,
+                "false_interruption_timeout": 1.5,
             },
         },
         # How long the customer can go quiet before the silence safety net
@@ -1248,7 +1332,25 @@ async def entrypoint(ctx: JobContext):
     HEARING_DIFFICULTY_BACKSTOP_THRESHOLD = 3
     consecutive_greeting_only_turns = 0
 
-    async def _end_call_for_hearing_difficulty() -> None:
+    # Deterministic backstop for the assistant itself getting stuck — real
+    # Kenya call data (Sep 2026) showed calls where the model's first real
+    # turn landed fine (intro + identity confirmation), but subsequent turns
+    # then just re-delivered the same scripted opening line 5-6+ times in a
+    # row instead of progressing, presumably because nothing it heard back
+    # made sense as an answer (garbled audio, background noise picked up as
+    # a "turn"). The model's own judgment-based "hearing difficulty" instinct
+    # already isn't reliable for the user-side version of this (see above),
+    # so it can't be trusted to notice it's repeating itself either — this
+    # needs the same kind of code-level backstop, keyed on the ASSISTANT's
+    # own consecutive turns instead of the user's.
+    REPEATED_ASSISTANT_TURN_BACKSTOP_THRESHOLD = 3
+    consecutive_repeated_assistant_turns = 0
+    last_assistant_utterance: str | None = None
+
+    def _is_near_duplicate_utterance(a: str, b: str) -> bool:
+        return SequenceMatcher(None, a, b).ratio() >= 0.8
+
+    async def _end_call_for_hearing_difficulty(reason: str) -> None:
         try:
             # Bypasses the LLM, so — same issue as the other hardcoded
             # safety-net lines — it wouldn't otherwise know the call's
@@ -1264,10 +1366,11 @@ async def entrypoint(ctx: JobContext):
             await session.say(closing_line, allow_interruptions=False)
         except Exception as e:
             print(f"Failed to speak hearing-difficulty backstop closing line: {e}")
-        ctx.shutdown(reason="hearing-difficulty backstop: repeated greeting-only exchanges")
+        ctx.shutdown(reason=reason)
 
     def _on_conversation_item_added(ev):
         nonlocal hmm_filler_task, consecutive_greeting_only_turns
+        nonlocal consecutive_repeated_assistant_turns, last_assistant_utterance
         item = ev.item
         role = getattr(item, "role", None)
         text = getattr(item, "text_content", None)
@@ -1291,9 +1394,24 @@ async def entrypoint(ctx: JobContext):
             if _is_greeting_only_utterance(text):
                 consecutive_greeting_only_turns += 1
                 if consecutive_greeting_only_turns >= HEARING_DIFFICULTY_BACKSTOP_THRESHOLD:
-                    asyncio.create_task(_end_call_for_hearing_difficulty())
+                    asyncio.create_task(_end_call_for_hearing_difficulty(
+                        "hearing-difficulty backstop: repeated greeting-only exchanges"
+                    ))
             else:
                 consecutive_greeting_only_turns = 0
+        if role == "assistant" and text:
+            normalized = text.strip().lower()
+            if last_assistant_utterance is not None and _is_near_duplicate_utterance(
+                normalized, last_assistant_utterance
+            ):
+                consecutive_repeated_assistant_turns += 1
+                if consecutive_repeated_assistant_turns >= REPEATED_ASSISTANT_TURN_BACKSTOP_THRESHOLD:
+                    asyncio.create_task(_end_call_for_hearing_difficulty(
+                        "hearing-difficulty backstop: assistant repeating its own prior turn"
+                    ))
+            else:
+                consecutive_repeated_assistant_turns = 0
+            last_assistant_utterance = normalized
 
     session.on("conversation_item_added", _on_conversation_item_added)
 
@@ -1752,7 +1870,20 @@ def prewarm(proc):
     # abstaining. 0.2s stays well under any real spoken word (a bare "Yes"
     # runs ~300-400ms, "Swahili" ~500-700ms) while filtering out sub-200ms
     # noise this bot has no legitimate reason to treat as a turn.
-    proc.userdata["vad"] = silero.VAD.load(min_speech_duration=0.2)
+    #
+    # Raised to 0.25s (TEST, pending Diana validating on a real call): real
+    # Kenya transcripts (Oct 2026) showed sustained choppy/fragmented
+    # customer audio -- "Eh, eh, eh... Mimi, mimi, mimi..." -- repeatedly
+    # triggering VAD and cutting Shanice off mid-sentence, well past what
+    # the adaptive interruption classifier + resume_false_interruption (see
+    # AgentSession below) could recover from, since that mechanism needs a
+    # clean silence gap to detect a false interruption and neither of those
+    # choppy bursts reliably produced one. 0.25s still stays comfortably
+    # under the ~300-400ms bare "Yes" floor above, so it shouldn't cost any
+    # genuine short answer -- it only raises the bar for the shortest noise
+    # fragments specifically. If live calls show this clipping real speech,
+    # revert to 0.2.
+    proc.userdata["vad"] = silero.VAD.load(min_speech_duration=0.25)
 
 
 if __name__ == "__main__":
