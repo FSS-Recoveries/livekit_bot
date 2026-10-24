@@ -1302,7 +1302,19 @@ async def entrypoint(ctx: JobContext):
         # rather than lowering further.
         turn_handling={
             "turn_detection": TurnDetector(),
-            "preemptive_generation": {"enabled": True},
+            # preemptive_tts: Azure's TTS plugin is non-streaming (confirmed
+            # against both the installed version and the latest release —
+            # TTSCapabilities(streaming=False) in azure/tts.py) — it must
+            # finish synthesizing a whole reply before any of it can play.
+            # Without this, that synthesis only starts after the customer's
+            # turn is confirmed over, landing entirely as dead air on top of
+            # LLM generation time. With it, synthesis starts speculatively
+            # on a likely-final interim transcript, overlapping with the
+            # remaining confirmation window instead of adding to it. Test
+            # value pending Diana validating on a live call — tradeoff is a
+            # small amount of wasted synthesis (cost, not correctness) if a
+            # speculative guess is wrong and the customer keeps talking.
+            "preemptive_generation": {"enabled": True, "preemptive_tts": True},
             "interruption": {
                 "mode": "adaptive",
                 "min_words": 2,
