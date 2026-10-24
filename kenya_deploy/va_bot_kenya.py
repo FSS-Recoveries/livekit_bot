@@ -778,7 +778,23 @@ def build_azure_tts(voice: str | None = None):
     """
     resolved = voice or os.getenv("AZURE_TTS_VOICE", "en-KE-AsiliaNeural")
     tts_cls = _SwahiliAwareAzureTTS if resolved.startswith("sw-") else azure.TTS
-    return tts_cls(voice=resolved)
+    # Azure's plugin is non-streaming (TTSCapabilities(streaming=False) in
+    # azure/tts.py, confirmed against both the installed version and the
+    # latest release) -- it must finish synthesizing a whole reply before
+    # any of it can play. StreamAdapter is LiveKit's own first-party fix for
+    # exactly this: it tokenizes the LLM's streamed output into sentences
+    # and calls the wrapped TTS per sentence, so sentence 1 can start
+    # playing while sentence 2 is still synthesizing, instead of the
+    # customer hearing nothing until the entire multi-sentence reply is
+    # done. text_pacing left at its default (False/off) rather than
+    # SentenceStreamPacer -- that batches multiple sentences into fewer,
+    # larger TTS calls for quality/interruption-cost reasons, the opposite
+    # of what we want here: every sentence flushed as soon as it's
+    # tokenized, to get audio starting as early as possible. Stacks with
+    # preemptive_tts (turn_handling, below) -- that controls *when*
+    # synthesis starts relative to turn confirmation, this controls how
+    # much has to finish synthesizing before anything can play.
+    return agents_tts.StreamAdapter(tts=tts_cls(voice=resolved))
 
 
 # ── SIP participant + caller phone number ────────────────────────────────
