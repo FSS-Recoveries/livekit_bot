@@ -842,8 +842,17 @@ GREETING_WAV_PATH = os.path.join(os.getcwd(), "Greeting.wav")
 # info / AMD still resolving).
 GREETING_V2_WAV_PATH = os.path.join(os.getcwd(), "Greeting v2.wav")
 OPENING_STALL_DELAY_SECONDS = 3
+# Thinking filler: a raw pre-recorded clip, not synthesized via session.say()
+# at call time. It used to go through Azure TTS, which (even wrapped in
+# StreamAdapter) still has a real connection/synthesis round-trip -- the real
+# reply would often finish and cancel the filler task before that round-trip
+# ever produced audible sound, which is almost certainly why it wasn't
+# audibly firing in real calls despite the timer running. A static clip has
+# no synthesis step to race, so once the delay below elapses it plays
+# immediately.
+HMM_WAV_PATH = os.path.join(os.getcwd(), "Hmm.wav")
 # From the agent's first real turn onward, how long it can sit "thinking"
-# before speaking a short "Hmm" filler while the real reply keeps loading.
+# before playing the Hmm filler while the real reply keeps loading.
 HMM_FILLER_DELAY_SECONDS = 3
 # How long to wait after the "Are you still with me?" check-in before
 # giving up and hanging up, if the caller still hasn't responded.
@@ -1469,11 +1478,11 @@ async def entrypoint(ctx: JobContext):
 
     async def _speak_hmm_after_delay() -> None:
         await asyncio.sleep(HMM_FILLER_DELAY_SECONDS)
-        # add_to_chat_ctx=False: this is a stalling interjection, not real
-        # dialogue — it must never enter the LLM's own conversation history,
-        # and if TTS happens to be down when this fires, it must not leave a
-        # phantom "assistant said this" line in the transcript either.
-        session.say("Hmm?", allow_interruptions=True, add_to_chat_ctx=False)
+        # Raw-track playback (like the opening greeting), not session.say() --
+        # bypasses TTS/session auto-reply entirely, so it never enters the
+        # LLM's conversation history and there's no synthesis round-trip left
+        # to race against the real reply arriving first. See HMM_WAV_PATH.
+        await _play_wav_greeting(ctx.room, HMM_WAV_PATH)
 
     def _on_agent_state_changed(ev) -> None:
         nonlocal first_response_delivered, opening_stall_task, hmm_filler_task
