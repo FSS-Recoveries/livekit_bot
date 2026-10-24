@@ -1809,15 +1809,35 @@ async def entrypoint(ctx: JobContext):
         # whole window: if the agent still hasn't spoken for real 6s after
         # the WAV finishes, it plays a second bridge clip.
         #
-        # `wait_until_finished=False` caps detection at the 20s timeout even
-        # if the caller talks continuously without a clean pause —
-        # otherwise AMD extends indefinitely waiting for silence.
+        # `wait_until_finished=False` caps detection at the configured
+        # timeout even if the caller talks continuously without a clean
+        # pause — otherwise AMD extends indefinitely waiting for silence.
+        #
+        # timeout=8.0 (SDK default is 20.0): a month of Kenya + Nigeria call
+        # data showed this ceiling is almost never the thing that actually
+        # catches a machine — real voicemail/IVR hits are rare (~0.3% of
+        # Nigeria calls in Oct; zero in Kenya's 852, plausible at that same
+        # low rate) — while the full 20s wait was the *normal* outcome, not
+        # the exception: 70% of Kenya calls and 43% of Nigeria calls timed
+        # out to "uncertain" rather than resolving quickly, each one costing
+        # the caller up to 20s of near-dead air before Shanice ever says
+        # anything substantive. The fast path for a clear, continuously
+        # speaking human (human_speech_threshold/human_silence_threshold in
+        # the SDK's AMD classifier) resolves in roughly a second regardless
+        # of this ceiling, so lowering it only cuts the worst-case wait on
+        # the ambiguous/slow-to-resolve calls that were paying the full
+        # price for a real-machine catch rate that, in practice, is low
+        # single digits per thousand. See the Voicemail-Style Greeting
+        # addition in prompt_kenya.txt's Dead-End Exit Rules for the
+        # non-blocking backstop that now covers what a shorter ceiling may
+        # miss. Test value pending Diana validating on a live call.
         async with AMD(
             session,
             llm=llm,
             stt=stt,
             suppress_compatibility_warning=True,
             wait_until_finished=False,
+            detection_options={"timeout": 8.0},
         ) as detector:
             await _play_wav_greeting(ctx.room, GREETING_WAV_PATH)
             opening_stall_task = asyncio.create_task(_play_opening_stall_after_delay())
