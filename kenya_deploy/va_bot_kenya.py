@@ -1188,12 +1188,14 @@ async def entrypoint(ctx: JobContext):
     # STT builder. Priced the same or cheaper than the pair it replaces
     # ($0.003/min vs ElevenLabs scribe_v2_realtime's ~$0.0065/min), billed
     # through the same LiveKit Cloud account -- no separate sign-up.
-    # Tradeoff: a single model, not the FallbackAdapter the English pair
-    # had, so a cartesia outage has no AMD-side STT fallback -- acceptable
-    # given AMD's worst failure mode here is "uncertain," treated the same
-    # as "human," not a dropped call. Test value pending Diana validating
-    # detection quality on live calls.
-    stt = inference.STT("cartesia/ink-whisper", language="en")
+    # fallback="deepgram/nova-3": inference.STT has its own native fallback
+    # param, no FallbackAdapter needed. deepgram/nova-3 is one of the other
+    # two models in AMD's own EVALUATED_STT_MODELS set (alongside
+    # cartesia/ink-whisper and assemblyai/universal-streaming-multilingual)
+    # -- LiveKit's own AMD-tested options, not an arbitrary pick -- so a
+    # cartesia outage still has a benchmarked fallback rather than none.
+    # Test value pending Diana validating detection quality on live calls.
+    stt = inference.STT("cartesia/ink-whisper", language="en", fallback="deepgram/nova-3")
     # The conversation itself now opens in Swahili by default per the
     # Language Selection Rule -- see set_active_language and the Opening
     # the Call section. Kept separate from `stt` above so AMD's own
