@@ -1175,7 +1175,25 @@ async def entrypoint(ctx: JobContext):
     # default below, since real call data shows voicemail/IVR menu prompts
     # ("Press one to save...") are consistently in English -- unrelated to
     # which language we open the actual conversation in.
-    stt = stt_by_language["english"]
+    #
+    # cartesia/ink-whisper rather than stt_by_language["english"]'s
+    # ElevenLabs+OpenAI pair: LiveKit's own published AMD benchmark
+    # (livekit.com/blog/answering-machine-detection) measured this exact
+    # pairing with google/gemini-3.1-flash-lite (already AMD's llm below) at
+    # a median 840ms time-to-detection, F1 ~94.7-98.2% -- a month of Kenya
+    # call data showed AMD resolving quickly on only ~13% of calls and
+    # running out the clock on ~70%, nowhere near that benchmark, and the
+    # English+ElevenLabs/OpenAI pairing was never itself benchmarked for
+    # this use case, just reused from the main conversation's language-pinned
+    # STT builder. Priced the same or cheaper than the pair it replaces
+    # ($0.003/min vs ElevenLabs scribe_v2_realtime's ~$0.0065/min), billed
+    # through the same LiveKit Cloud account -- no separate sign-up.
+    # Tradeoff: a single model, not the FallbackAdapter the English pair
+    # had, so a cartesia outage has no AMD-side STT fallback -- acceptable
+    # given AMD's worst failure mode here is "uncertain," treated the same
+    # as "human," not a dropped call. Test value pending Diana validating
+    # detection quality on live calls.
+    stt = inference.STT("cartesia/ink-whisper", language="en")
     # The conversation itself now opens in Swahili by default per the
     # Language Selection Rule -- see set_active_language and the Opening
     # the Call section. Kept separate from `stt` above so AMD's own
