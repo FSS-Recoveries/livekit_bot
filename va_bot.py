@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import os
+import random
 import re
 import requests
 import inspect
@@ -15,11 +16,11 @@ from dotenv import load_dotenv
 from livekit import rtc
 from livekit import api as lk_api
 from livekit.agents import (
+    AgentServer,
     AgentSession,
     Agent,
     RoomInputOptions,
     JobContext,
-    WorkerOptions,
     cli,
     function_tool,
     RunContext,
@@ -87,6 +88,10 @@ load_dotenv(".env.local")
 if not os.getenv("ELEVEN_API_KEY") and os.getenv("ELEVENLABS_API_KEY"):
     os.environ["ELEVEN_API_KEY"] = os.getenv("ELEVENLABS_API_KEY")
 
+# When true, skip writing call records to Firestore (see _save_call_record)
+# so test calls don't pollute the live_kit_bot_calls collection.
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes", "y"}
+
 # ── Firebase (call recordings + call records) ────────────────────────────
 FIREBASE_SERVICE_ACCOUNT_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "service_account.json")
 FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET", "fssspark.firebasestorage.app")
@@ -141,17 +146,28 @@ async def _start_call_recording(ctx: JobContext) -> "lk_api.EgressInfo | None":
         return None
 
 
-async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
-    """Stops egress, waits for the upload to finish, and returns a Firebase download URL."""
-    if egress_info is None or _firebase_app is None:
+def _egress_seconds(info) -> float | None:
+    """Billable egress duration from EgressInfo's started_at/ended_at (Unix
+    nanoseconds; 0 while unset)."""
+    if info is None or not info.started_at or not info.ended_at:
         return None
+    return max(info.ended_at - info.started_at, 0) / 1e9
+
+
+async def _finish_call_recording(ctx: JobContext, egress_info) -> tuple[str | None, float | None]:
+    """Stops egress, waits for the upload to finish, and returns a Firebase
+    download URL plus the egress's billable duration in seconds (None if
+    unknown — the caller falls back to the call's own duration)."""
+    if egress_info is None:
+        return None, None
     try:
         await ctx.api.egress.stop_egress(lk_api.StopEgressRequest(egress_id=egress_info.egress_id))
     except Exception as e:
         print(f"Failed to stop call recording: {e}")
-        return None
+        return None, None
 
     # Egress finalizes and uploads the file asynchronously after stop; poll briefly.
+    info = None
     for _ in range(15):
         await asyncio.sleep(2)
         try:
@@ -160,18 +176,22 @@ async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
             )
         except Exception as e:
             print(f"Failed to poll call recording status: {e}")
-            return None
+            return None, _egress_seconds(info)
         if not resp.items:
-            return None
+            return None, _egress_seconds(info)
         info = resp.items[0]
         if info.status == lk_api.EgressStatus.EGRESS_COMPLETE:
             break
         if info.status in (lk_api.EgressStatus.EGRESS_FAILED, lk_api.EgressStatus.EGRESS_ABORTED):
             print(f"Call recording failed: {info.error}")
-            return None
+            return None, _egress_seconds(info)
     else:
         print("Timed out waiting for call recording to finish uploading.")
-        return None
+        return None, _egress_seconds(info)
+
+    egress_seconds = _egress_seconds(info)
+    if _firebase_app is None:
+        return None, egress_seconds
 
     filepath = f"{RECORDINGS_FOLDER}/{ctx.room.name}.ogg"
     try:
@@ -189,10 +209,10 @@ async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
         return (
             f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_STORAGE_BUCKET}"
             f"/o/{encoded_path}?alt=media&token={token}"
-        )
+        ), egress_seconds
     except Exception as e:
         print(f"Failed to finalize call recording URL: {e}")
-        return None
+        return None, egress_seconds
 
 
 # Rates below are LiveKit's own Inference rate card (Build/Ship plan),
@@ -209,21 +229,23 @@ async def _finish_call_recording(ctx: JobContext, egress_info) -> str | None:
 # LLM rates and the Fish Audio TTS rate were confirmed identical on both as
 # of the same date.
 #
-# The `provider`/`model` strings these usage entries actually contain once
-# routed through the gateway haven't all been individually confirmed against
-# a real call (see per-model notes below) — matching may still silently
-# return None for an entry if a provider string differs from what's assumed.
+# The `provider`/`model` strings below were confirmed against real usage
+# entries pulled from Firestore (2026-09): every model routed through
+# LiveKit Inference reports provider="livekit" regardless of the underlying
+# vendor, and `model` is the fully-qualified "vendor/model" string (e.g.
+# "google/gemini-3.1-flash-lite", "deepgram/nova-3", "openai/gpt-5-mini") —
+# not the bare model name. The original guesses below (bare model names for
+# Gemini, and provider=="Deepgram"/"api.openai.com" for Deepgram/GPT-5-mini)
+# never matched a single real entry: Deepgram (used on ~99% of calls) and
+# Gemini (used on ~92% of calls) — the two highest-volume components — were
+# silently costed at $0 for every call until this was caught by auditing
+# real usage data against total_estimated_cost_usd. Match on `model` alone
+# for every LiveKit-Inference-routed model; only ElevenLabs' direct plugin
+# (not Inference) reports its own real provider string ("ElevenLabs").
 # Azure isn't priced here at all: its plugin doesn't report
 # model_provider/model_name metadata the way the others do, so it hasn't
 # been confirmed against a real usage entry to know the exact keys it would
 # use (even though it's currently unused as a fallback — see build_azure_tts).
-#
-# Gemini 3.1 Flash-Lite is matched on `model` alone (no `provider` check,
-# unlike the OpenAI/ElevenLabs/Deepgram entries below) — the exact
-# `provider` string the Google plugin reports for its usage metrics hasn't
-# been confirmed against a real call. If estimated_cost_usd comes back None
-# for Gemini usage entries, check a real usage dict's `provider` value and
-# add that condition back for a tighter match.
 _GEMINI_FLASH_LITE_INPUT_PER_TOKEN = 0.25 / 1_000_000
 _GEMINI_FLASH_LITE_CACHED_INPUT_PER_TOKEN = 0.025 / 1_000_000
 _GEMINI_FLASH_LITE_OUTPUT_PER_TOKEN = 1.50 / 1_000_000  # includes thinking tokens
@@ -249,6 +271,11 @@ _DEEPGRAM_NOVA3_PER_SECOND = 0.0048 / 60
 # `model` alone, same reasoning as Gemini above — the `provider` string
 # these entries report hasn't been confirmed against a real usage entry.
 _FISHAUDIO_S21PRO_PER_CHARACTER = 15.00 / 1_000_000
+# fishaudio/s2-pro (the in-list TTS fallback below s2.1-pro) had no rate
+# entry at all before this — always fell through to `return None`. No
+# separate published rate found for s2-pro vs s2.1-pro; reusing the
+# s2.1-pro rate is an approximation until a distinct one is confirmed.
+_FISHAUDIO_S2PRO_PER_CHARACTER = _FISHAUDIO_S21PRO_PER_CHARACTER
 _INWORLD_TTS_15_MAX_PER_CHARACTER = 35.00 / 1_000_000
 # AssemblyAI Universal-Streaming-Multilingual (third STT fallback): $0.0025/min,
 # the cheapest STT on LiveKit's Inference rate card. Matched on `model`
@@ -261,10 +288,31 @@ _ASSEMBLYAI_UNIVERSAL_STREAMING_MULTILINGUAL_PER_SECOND = 0.0025 / 60
 _GROK_4_1_FAST_INPUT_PER_TOKEN = 0.20 / 1_000_000
 _GROK_4_1_FAST_OUTPUT_PER_TOKEN = 0.50 / 1_000_000
 
+# ── LiveKit platform (non-inference) costs ──────────────────────────────
+# Ship-plan overage rates from livekit.com/pricing as of 2026-10-04 (same
+# figures get_session_cost.py uses). Unlike the inference rates above, these
+# aren't reported by ModelUsageCollector at all — _platform_usage_entries()
+# builds them from our own timings and writes them into the same `usage`
+# list as type="platform_usage", so total_estimated_cost_usd and the call
+# monitor pick them up with no separate field to join. Each plan's included
+# monthly quota (Ship: 5,000 agent-session min, 5,000 SIP min, 600
+# transcode min) isn't netted out — these are marginal per-call costs, not
+# the invoice. Scale is cheaper on SIP ($0.003) and egress ($0.004).
+# Not costed: WebRTC participant minutes ($0.0005/min) and downstream
+# bandwidth ($0.12/GB) — both negligible for one audio-only agent per room.
+_LIVEKIT_AGENT_SESSION_PER_SECOND = 0.01 / 60
+_LIVEKIT_THIRD_PARTY_SIP_PER_SECOND = 0.004 / 60
+# Room-composite egress with audio_only=True bills as audio-only transcode.
+_LIVEKIT_EGRESS_AUDIO_PER_SECOND = 0.005 / 60
+# Krisp noise cancellation: BVC / BVCTelephony are Krisp VIVA (voice
+# isolation), billed at $0.0012/min past the plan quota (Ship: 1,000 min) —
+# unlike plain Krisp NC (noise suppression only), which is free on every plan.
+_LIVEKIT_KRISP_VIVA_PER_SECOND = 0.0012 / 60
+
 
 def _estimate_entry_cost(entry: dict) -> float | None:
     provider, model = entry.get("provider"), entry.get("model")
-    if model == "gemini-3.1-flash-lite":
+    if model == "google/gemini-3.1-flash-lite":
         # input_tokens already includes input_cached_tokens as a subset —
         # only the non-cached remainder is billed at the full input rate.
         cached = entry.get("input_cached_tokens", 0)
@@ -274,7 +322,7 @@ def _estimate_entry_cost(entry: dict) -> float | None:
             + cached * _GEMINI_FLASH_LITE_CACHED_INPUT_PER_TOKEN
             + entry.get("output_tokens", 0) * _GEMINI_FLASH_LITE_OUTPUT_PER_TOKEN
         )
-    if provider == "api.openai.com" and model == "gpt-5-mini":
+    if model == "openai/gpt-5-mini":
         cached = entry.get("input_cached_tokens", 0)
         uncached = max(entry.get("input_tokens", 0) - cached, 0)
         return (
@@ -286,10 +334,12 @@ def _estimate_entry_cost(entry: dict) -> float | None:
         return entry.get("characters_count", 0) * _ELEVENLABS_FLASH_PER_CHARACTER
     if model == "elevenlabs/scribe_v2_realtime":
         return entry.get("audio_duration", 0) * _ELEVENLABS_SCRIBE_V2_REALTIME_PER_SECOND
-    if provider == "Deepgram" and model == "nova-3":
+    if model == "deepgram/nova-3":
         return entry.get("audio_duration", 0) * _DEEPGRAM_NOVA3_PER_SECOND
     if model == "fishaudio/s2.1-pro":
         return entry.get("characters_count", 0) * _FISHAUDIO_S21PRO_PER_CHARACTER
+    if model == "fishaudio/s2-pro":
+        return entry.get("characters_count", 0) * _FISHAUDIO_S2PRO_PER_CHARACTER
     if model == "inworld/inworld-tts-1.5-max":
         return entry.get("characters_count", 0) * _INWORLD_TTS_15_MAX_PER_CHARACTER
     if model == "assemblyai/universal-streaming-multilingual":
@@ -299,14 +349,66 @@ def _estimate_entry_cost(entry: dict) -> float | None:
             entry.get("input_tokens", 0) * _GROK_4_1_FAST_INPUT_PER_TOKEN
             + entry.get("output_tokens", 0) * _GROK_4_1_FAST_OUTPUT_PER_TOKEN
         )
+    if model == "livekit/agent-session":
+        return entry.get("duration_seconds", 0) * _LIVEKIT_AGENT_SESSION_PER_SECOND
+    if model == "livekit/sip-third-party":
+        return entry.get("duration_seconds", 0) * _LIVEKIT_THIRD_PARTY_SIP_PER_SECOND
+    if model == "livekit/egress-audio":
+        return entry.get("duration_seconds", 0) * _LIVEKIT_EGRESS_AUDIO_PER_SECOND
+    if model in ("livekit/krisp-bvc-telephony", "livekit/krisp-bvc"):
+        return entry.get("duration_seconds", 0) * _LIVEKIT_KRISP_VIVA_PER_SECOND
     return None
+
+
+_BILLED_USAGE_TYPES = {"stt_usage", "llm_usage", "tts_usage", "platform_usage"}
+
+
+def _platform_usage_entries(
+    agent_session_seconds: float,
+    sip_seconds: float | None,
+    egress_seconds: float | None,
+    noise_cancellation_seconds: float | None,
+    noise_cancellation_model: str,
+) -> list[dict]:
+    """LiveKit platform line items for one call, shaped like the inference
+    usage entries (type/provider/model) so _add_estimated_costs prices them
+    the same way. A *_seconds of None means that component never ran
+    (console mode has no SIP, recording failed to start, or the call ended
+    before session.start() enabled noise cancellation)."""
+    components = [
+        ("agent_session", "livekit/agent-session", agent_session_seconds),
+        ("sip", "livekit/sip-third-party", sip_seconds),
+        ("egress", "livekit/egress-audio", egress_seconds),
+        ("noise_cancellation", noise_cancellation_model, noise_cancellation_seconds),
+    ]
+    return [
+        {
+            "type": "platform_usage",
+            "provider": "livekit",
+            "model": model,
+            "component": component,
+            "duration_seconds": round(max(seconds, 0.0), 1),
+        }
+        for component, model, seconds in components
+        if seconds is not None
+    ]
 
 
 def _add_estimated_costs(usage: list) -> tuple[list, float]:
     """Annotates each usage entry with an estimated_cost_usd and returns the
     enriched list alongside the total. Entries with no known pricing (e.g.
     Azure TTS, LiveKit's own interruption/turn-detector usage) are left
-    with estimated_cost_usd=None rather than guessed."""
+    with estimated_cost_usd=None rather than guessed.
+
+    Logs a warning for any stt/llm/tts entry that falls through with no
+    rate — those types are always separately billed (unlike
+    interruption/eot usage), so a None there is a real pricing-table gap,
+    not an expected one. This is exactly the failure mode that silently
+    cost Deepgram and Gemini usage at $0 for every call until an audit
+    against total_estimated_cost_usd caught it (see the rate-card comment
+    above _estimate_entry_cost) — logging it here means a newly-added
+    variant model with no rate entry shows up in logs immediately instead
+    of months later."""
     total = 0.0
     enriched = []
     for entry in usage:
@@ -314,6 +416,12 @@ def _add_estimated_costs(usage: list) -> tuple[list, float]:
         cost = _estimate_entry_cost(entry)
         if cost is not None:
             total += cost
+        elif entry.get("type") in _BILLED_USAGE_TYPES:
+            print(
+                f"No cost rate for billed usage entry: type={entry.get('type')} "
+                f"provider={entry.get('provider')} model={entry.get('model')} — "
+                f"add a rate to _estimate_entry_cost, this call's cost is being undercounted."
+            )
         entry["estimated_cost_usd"] = round(cost, 6) if cost is not None else None
         enriched.append(entry)
     return enriched, round(total, 6)
@@ -328,10 +436,14 @@ def _save_call_record(
     duration_seconds: float,
     usage: list,
     phone_number: str | None,
+    fallback_variants: dict | None = None,
 ) -> None:
     if _firebase_app is None:
         return
     usage, total_estimated_cost_usd = _add_estimated_costs(usage)
+    if DRY_RUN:
+        print(f"[DRY_RUN] Would save call record for room {room_name} to Firestore.")
+        return
     try:
         db = fb_firestore.client()
         db.collection(CALLS_COLLECTION).document(room_name).set(
@@ -345,6 +457,11 @@ def _save_call_record(
                 "duration_seconds": round(duration_seconds, 1),
                 "usage": usage,
                 "total_estimated_cost_usd": total_estimated_cost_usd,
+                # Which A/B variant was picked for each of stt/llm/tts
+                # (provider order) and prompt (prompt.txt vs promptB.txt)
+                # this call, e.g. {"stt": "A", "llm": "B", "tts": "A",
+                # "prompt": "B"} — for comparing outcomes across variants.
+                "fallback_variants": fallback_variants,
                 "ended_at": fb_firestore.SERVER_TIMESTAMP,
                 # Picked up by the separate livekit_pipeline.py batch script
                 # (AI extraction, institution lookup, call_notes upserts,
@@ -718,6 +835,16 @@ HMM_FILLER_DELAY_SECONDS = 3
 # How long to wait after the "Are you still with me?" check-in before
 # giving up and hanging up, if the caller still hasn't responded.
 SILENCE_SHUTDOWN_DELAY_SECONDS = 12
+# Hard ceiling on "Are you still with me?" check-ins per call, matching the
+# prompt's own "wait, then check in — if no response to a SECOND check,
+# hang up" language (see prompt.txt, "When There Is Silence"). Enforced in
+# code (see _on_user_state_changed below) because VAD alone isn't a
+# trustworthy "the caller is really there" signal: background line noise on
+# a bad connection can trip the "speaking" state without any real content
+# ever being transcribed, which used to re-arm the check-in indefinitely —
+# real calls were observed repeating this line 5-9+ times over several
+# minutes of dead air before ever hanging up.
+MAX_SILENCE_CHECKINS = 2
 
 
 async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
@@ -765,6 +892,82 @@ async def _play_wav_greeting(room: rtc.Room, wav_path: str) -> None:
             await room.local_participant.unpublish_track(publication.sid)
 
 
+# ── FallbackAdapter A/B variants ────────────────────────────────────────
+# Two candidate provider orderings per adapter (STT/LLM/TTS), plus two
+# candidate system prompts, randomly assigned per call via
+# _pick_fallback_variants() so outcomes can be compared across the two. For
+# STT/LLM/TTS, "A" is the pre-existing fixed ordering and "B" swaps which
+# provider is primary vs. first fallback; for the prompt, "A" is prompt.txt
+# and "B" is promptB.txt. Built fresh per call (not module-level instances)
+# since entrypoint() already constructs the adapters fresh for every job.
+#
+# Model lists below are the single source of truth for "which models can a
+# call select" — also consumed by _assert_variant_models_priced() just below
+# so a newly-added variant model can't silently ship with no
+# _estimate_entry_cost() rate the way google/gemini-3.1-flash-lite and
+# deepgram/nova-3 did before the 2026-09 audit (see the rate-card comment
+# above _estimate_entry_cost).
+_STT_VARIANT_MODELS: dict[str, list[str]] = {
+    "A": ["elevenlabs/scribe_v2_realtime", "deepgram/nova-3", "assemblyai/universal-streaming-multilingual"],
+    "B": ["deepgram/nova-3", "assemblyai/universal-streaming-multilingual", "elevenlabs/scribe_v2_realtime"],
+}
+_LLM_VARIANT_MODELS: dict[str, list[str]] = {
+    "A": ["google/gemini-3.1-flash-lite", "openai/gpt-5-mini", "xai/grok-4-1-fast-non-reasoning"],
+    "B": ["openai/gpt-5-mini", "google/gemini-3.1-flash-lite", "xai/grok-4-1-fast-non-reasoning"],
+}
+# (model, voice_id, speed) — voice/speed don't affect price (TTS is billed
+# per character regardless of voice; see _estimate_entry_cost), so only the
+# model half of each tuple feeds _assert_variant_models_priced().
+_TTS_VARIANT_MODELS: dict[str, list[tuple[str, str, float]]] = {
+    "A": [("fishaudio/s2.1-pro", "v_HZzUP7a6wqSZ", 1.15), ("fishaudio/s2-pro", "v_HZzUP7a6wqSZ", 1.15)],
+    "B": [("fishaudio/s2-pro", "v_ckr9NXBNDLXy", 1.20), ("fishaudio/s2.1-pro", "v_ckr9NXBNDLXy", 1.20)],
+}
+
+
+def _build_stt_variant(name: str):
+    return [inference.STT(model, language="en") for model in _STT_VARIANT_MODELS.get(name, _STT_VARIANT_MODELS["A"])]
+
+
+def _build_llm_variant(name: str):
+    return [inference.LLM(model) for model in _LLM_VARIANT_MODELS.get(name, _LLM_VARIANT_MODELS["A"])]
+
+
+def _build_tts_variant(name: str):
+    return [
+        inference.TTS(model=model, voice=voice, extra_kwargs={"speed": speed, "temperature": 0, "latency": "normal"})
+        for model, voice, speed in _TTS_VARIANT_MODELS.get(name, _TTS_VARIANT_MODELS["A"])
+    ]
+
+
+def _assert_variant_models_priced() -> None:
+    """Fails fast at import time (before this worker accepts any calls) if
+    any model any A/B variant can select has no _estimate_entry_cost() rate
+    — the same silent-$0-cost failure mode that hit Deepgram/Gemini before
+    the 2026-09 audit (see the rate-card comment above _estimate_entry_cost),
+    except caught immediately instead of discovered weeks later by
+    re-auditing real usage data against total_estimated_cost_usd."""
+    all_models = {m for models in _STT_VARIANT_MODELS.values() for m in models}
+    all_models |= {m for models in _LLM_VARIANT_MODELS.values() for m in models}
+    all_models |= {model for models in _TTS_VARIANT_MODELS.values() for model, _voice, _speed in models}
+    unpriced = sorted(m for m in all_models if _estimate_entry_cost({"model": m}) is None)
+    if unpriced:
+        raise RuntimeError(
+            f"No _estimate_entry_cost() rate for A/B variant model(s): {', '.join(unpriced)} — "
+            f"add a rate before enabling this variant, or every call using it is silently costed at $0."
+        )
+
+
+_assert_variant_models_priced()
+
+
+def _pick_fallback_variants() -> dict:
+    return {k: random.choice(("A", "B")) for k in ("stt", "llm", "tts", "prompt")}
+
+
+def _prompt_path_for_variant(name: str) -> str:
+    return os.path.join(os.getcwd(), "promptB.txt" if name == "B" else "prompt.txt")
+
+
 # ── Entrypoint ──────────────────────────────────────────────────────────
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
@@ -779,8 +982,21 @@ async def entrypoint(ctx: JobContext):
     # Recording doesn't gate any of that; it's only actually needed later,
     # in _on_shutdown.
     call_started_at = time.time()
-    call_state = {"amd_category": None}
+    # sip_joined_at: when our agent first saw the SIP participant (start of
+    # billable SIP minutes, approximately); stays None in console mode.
+    # nc_started_at / nc_model: when (and which) Krisp noise cancellation
+    # was enabled — at session.start(), see below.
+    call_state = {"amd_category": None, "sip_joined_at": None, "nc_started_at": None, "nc_model": "livekit/krisp-bvc"}
+    # A/B provider-order variant per FallbackAdapter, picked once per call
+    # and recorded on the call's Firestore doc (see _save_call_record).
+    fallback_variants = _pick_fallback_variants()
     transcript_lines: list[str] = []
+    # Usage metrics (LLM tokens, TTS characters, STT audio seconds), broken
+    # down per provider/model — persisted to the call's Firestore record.
+    # Created up here, before _on_shutdown is registered, because that
+    # callback reads it — and the no-SIP-participant early exit below can
+    # trigger shutdown before the session setup further down ever runs.
+    usage_collector = ModelUsageCollector()
     egress_task = asyncio.create_task(_start_call_recording(ctx))
     max_duration_task: asyncio.Task | None = None
     opening_stall_task: asyncio.Task | None = None
@@ -788,6 +1004,9 @@ async def entrypoint(ctx: JobContext):
     silence_shutdown_task: asyncio.Task | None = None
 
     async def _on_shutdown():
+        # The call (agent session + SIP leg) ends at the delete_room() just
+        # below — timestamp it before the up-to-~30s recording finalization.
+        call_ended_at = time.time()
         # ctx.shutdown() (used everywhere we decide to end the call) only
         # disconnects our own agent from the room — it does NOT hang up the
         # actual phone call. The SIP participant stays connected with dead
@@ -813,8 +1032,21 @@ async def entrypoint(ctx: JobContext):
             silence_shutdown_task.cancel()
 
         egress_info = await egress_task
-        recording_url = await _finish_call_recording(ctx, egress_info)
+        recording_url, egress_seconds = await _finish_call_recording(ctx, egress_info)
+        if egress_info is not None and egress_seconds is None:
+            # Egress ran but its final timings couldn't be read — it records
+            # the whole room, so the call's own duration is a close stand-in.
+            egress_seconds = call_ended_at - call_started_at
+        sip_joined_at = call_state["sip_joined_at"]
+        nc_started_at = call_state["nc_started_at"]
         usage = [u.model_dump(mode="json") for u in usage_collector.flatten()]
+        usage += _platform_usage_entries(
+            agent_session_seconds=call_ended_at - call_started_at,
+            sip_seconds=call_ended_at - sip_joined_at if sip_joined_at is not None else None,
+            egress_seconds=egress_seconds,
+            noise_cancellation_seconds=call_ended_at - nc_started_at if nc_started_at is not None else None,
+            noise_cancellation_model=call_state["nc_model"],
+        )
         _save_call_record(
             ctx.room.name,
             transcript_lines,
@@ -824,6 +1056,7 @@ async def entrypoint(ctx: JobContext):
             time.time() - call_started_at,
             usage,
             phone_number,
+            fallback_variants,
         )
 
     ctx.add_shutdown_callback(_on_shutdown)
@@ -836,18 +1069,35 @@ async def entrypoint(ctx: JobContext):
     if not is_console:
         sip_participant = await _wait_for_sip_participant(ctx.room)
         if sip_participant:
+            call_state["sip_joined_at"] = time.time()
             print(f"SIP participant joined: {sip_participant.identity}")
             print(f"Participant attributes: {dict(sip_participant.attributes)}")
             phone_number = _get_caller_phone_number(sip_participant)
         else:
-            print("Warning: no SIP participant found within timeout")
+            # The phone leg never made it into the room (e.g. the call was
+            # cancelled between Asterisk and LiveKit after the dispatch rule
+            # had already created the room and dispatched us). Carrying on
+            # here used to leave the agent alone in an empty room — greeting
+            # and AMD into nothing, recording dead air, with neither the
+            # silence check-in (needs a linked participant) nor the 6-min cap
+            # ever firing — until LiveKit's 300s empty-room timeout closed
+            # it: ~10% of all calls, each a silent ~5-minute record. End the
+            # job now; _on_shutdown deletes the room and still saves the
+            # call record.
+            print("Warning: no SIP participant found within timeout; ending call")
+            ctx.shutdown(reason="no SIP participant joined")
+            return
         print(f"Customer phone number: {phone_number}")
 
         if phone_number:
             lookup_task = asyncio.create_task(_fetch_customer_snapshot(phone_number))
 
-    # Load system prompt (fallback if file missing)
-    prompt_path = os.path.join(os.getcwd(), "prompt.txt")
+    # Load system prompt (fallback if file missing). Variant picked once per
+    # call by _pick_fallback_variants() above — "A" is prompt.txt, "B" is
+    # promptB.txt — so outcomes can be compared the same way as the
+    # STT/LLM/TTS A/B variants (see fallback_variants on the call's
+    # Firestore doc, written by _save_call_record).
+    prompt_path = _prompt_path_for_variant(fallback_variants["prompt"])
     try:
         with open(prompt_path, "r", encoding="utf-8") as f:
             system_prompt = f.read().strip()
@@ -905,13 +1155,12 @@ async def entrypoint(ctx: JobContext):
     # ($0.0025/min, the lowest on LiveKit's STT rate card) rather than being
     # dropped — if Deepgram errors out mid-call, still-decent accuracy at
     # minimal cost, just not the fastest option.
-    stt = agents_stt.FallbackAdapter(
-        [
-            inference.STT("deepgram/nova-3", language="en"),
-            inference.STT("assemblyai/universal-streaming-multilingual", language="en"),
-            inference.STT("elevenlabs/scribe_v2_realtime", language="en"),
-        ]
-    )
+    #
+    # Ordering is one of two A/B variants picked at call start by
+    # _pick_fallback_variants() (see fallback_variants above) — variant "A"
+    # is the ordering described above, "B" swaps Deepgram and ElevenLabs to
+    # compare which one performs better as primary. See _build_stt_variant.
+    stt = agents_stt.FallbackAdapter(_build_stt_variant(fallback_variants["stt"]))
     # LLM: Gemini 3.1 Flash-Lite as primary, gpt-5-mini as fallback if
     # Gemini errors out. Worth knowing: Gemini 2.5 (Flash and Flash-Lite) has
     # a documented upstream quirk where it can return finish_reason=STOP
@@ -936,13 +1185,12 @@ async def entrypoint(ctx: JobContext):
     # internal chain-of-thought before answering, which only adds latency
     # here — this prompt needs reliable instruction-following and tool
     # calls, not multi-step reasoning.
-    llm = agents_llm.FallbackAdapter(
-        [
-            inference.LLM("google/gemini-3.1-flash-lite"),
-            inference.LLM("openai/gpt-5-mini"),
-            inference.LLM("xai/grok-4-1-fast-non-reasoning"),
-        ]
-    )
+    #
+    # Ordering is one of two A/B variants picked at call start (see
+    # fallback_variants above) — variant "A" is the ordering described
+    # above, "B" swaps Gemini and gpt-5-mini to compare which one performs
+    # better as primary. See _build_llm_variant.
+    llm = agents_llm.FallbackAdapter(_build_llm_variant(fallback_variants["llm"]))
     # Silero VAD runs locally, not through any external provider — it never
     # needed an API key, so it's left as-is (still prewarmed per worker
     # process in prewarm(), not per call).
@@ -955,37 +1203,12 @@ async def entrypoint(ctx: JobContext):
     # commented out here — swap either back in as the 2nd list entry to
     # restore it as a fallback. Note there's currently no active fallback:
     # if Fish Audio errors out mid-call, TTS has nothing to fall back to.
+    #
+    # Ordering is one of two A/B variants picked at call start (see
+    # fallback_variants above) — variant "A" is s2.1-pro primary / s2-pro
+    # fallback as described above, "B" swaps them. See _build_tts_variant.
     tts = agents_tts.FallbackAdapter(
-        [
-            inference.TTS(
-                model="fishaudio/s2.1-pro",
-                voice="v_ckr9NXBNDLXy",#"v_VeRxYTHdQqGg",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-                extra_kwargs={"speed": 1.30, "temperature": 0, "latency": "normal"},
-            ),
-
-            inference.TTS(
-                model="fishaudio/s2-pro",
-                voice="v_VeRxYTHdQqGg",#"v_ckr9NXBNDLXy",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-                extra_kwargs={"speed": 1.30, "temperature": 0, "latency": "normal"},
-            ),
-
-            #inference.TTS(
-            #    model="inworld/inworld-tts-1.5-max",
-            #    voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-            #    extra_kwargs={"speaking_rate": 1.35, "temperature": 0, "latency": "normal"},
-            #   ),
-                
-            #build_elevenlabs_tts(),
-
-            #inference.TTS(
-                #model="inworld/inworld-tts-1.5-mini",
-                #voice="v_VeRxYTHdQqGg",#"v_a8NVrqPTCW4q",#"v_XSvqo8UVEFYo","v_tkbNkcSD62zN",#"v_ebJJAf8QhLMs",
-                #extra_kwargs={"speaking_rate": 1.3, "temperature": 0, "latency": "normal"},
-                #),
-            #build_azure_tts(),
-            
-            
-        ],
+        _build_tts_variant(fallback_variants["tts"]),
         # 0: on any mid-stream failure, switch to the next TTS immediately
         # instead of retrying the same provider first. Each retry re-opens
         # a fresh stream for the same text; if the failed attempt had
@@ -997,10 +1220,6 @@ async def entrypoint(ctx: JobContext):
     )
 
 
-
-    # Usage metrics (LLM tokens, TTS characters, STT audio seconds), broken
-    # down per provider/model — persisted to the call's Firestore record.
-    usage_collector = ModelUsageCollector()
 
     # Session
     session = AgentSession(
@@ -1153,6 +1372,14 @@ async def entrypoint(ctx: JobContext):
     # greeting/AMD window too — session.say() below simply queues until AMD
     # releases that lock if this fires mid-detection.
     checked_in = False
+    # Counts "Are you still with me?" check-ins since the last CONFIRMED
+    # (transcribed, non-blank) sign the caller is there — deliberately
+    # separate from `checked_in`, which the "speaking" VAD transition below
+    # resets on unconfirmed noise alone. Only _on_user_input_transcribed
+    # (real content) resets this counter, so it's what actually bounds the
+    # loop once MAX_SILENCE_CHECKINS is hit, regardless of how many times
+    # line noise fools VAD into "speaking" in between.
+    silence_checkin_count = 0
 
     def _cancel_pending_silence_shutdown() -> None:
         nonlocal checked_in, silence_shutdown_task
@@ -1161,13 +1388,18 @@ async def entrypoint(ctx: JobContext):
             silence_shutdown_task.cancel()
 
     def _on_user_state_changed(ev):
-        nonlocal checked_in, silence_shutdown_task
+        nonlocal checked_in, silence_shutdown_task, silence_checkin_count
         if ev.new_state == "speaking":
             # Unambiguous real speech (VAD-confirmed, not just a stray final
             # transcript) — safe to cancel here directly rather than waiting
             # on _on_user_input_transcribed, which can lag several seconds
             # behind the STT provider (e.g. mid-fallover on the STT
-            # FallbackAdapter).
+            # FallbackAdapter). Deliberately does NOT reset
+            # silence_checkin_count: VAD alone (background noise/static) is
+            # not proof the caller is really there, so it can cancel an
+            # in-flight hang-up countdown but must not re-arm the full
+            # MAX_SILENCE_CHECKINS budget — only confirmed transcribed
+            # content does that, in _on_user_input_transcribed below.
             _cancel_pending_silence_shutdown()
             return
         if ev.new_state != "away":
@@ -1181,6 +1413,17 @@ async def entrypoint(ctx: JobContext):
             return
         if not checked_in:
             checked_in = True
+            if silence_checkin_count >= MAX_SILENCE_CHECKINS:
+                # Already checked in MAX_SILENCE_CHECKINS times with no
+                # confirmed response since — mirrors the prompt's own "no
+                # response to a second check" instruction. Stop asking and
+                # end the call now rather than re-arming another round,
+                # which is what let real calls loop this line 5-9+ times
+                # over minutes of dead air when noise kept tripping
+                # "speaking" without ever producing real content.
+                ctx.shutdown(reason="no response after max silence check-ins")
+                return
+            silence_checkin_count += 1
             # session.say() returns a SpeechHandle (already queued/running,
             # not a coroutine) — wrapping it in asyncio.create_task() raises
             # TypeError, so it's called directly, fire-and-forget.
@@ -1192,6 +1435,7 @@ async def entrypoint(ctx: JobContext):
         ctx.shutdown(reason="no response after silence check")
 
     def _on_user_input_transcribed(ev) -> None:
+        nonlocal silence_checkin_count
         # A real call showed the bot repeating "Are you still with me?"
         # three times over ~5 minutes without ever hanging up: background
         # line noise kept producing stray *final* transcripts (sometimes
@@ -1203,6 +1447,7 @@ async def entrypoint(ctx: JobContext):
         # really there.
         if ev.is_final and ev.transcript.strip():
             _cancel_pending_silence_shutdown()
+            silence_checkin_count = 0
 
     session.on("user_state_changed", _on_user_state_changed)
     session.on("user_input_transcribed", _on_user_input_transcribed)
@@ -1276,6 +1521,8 @@ async def entrypoint(ctx: JobContext):
     noise_cancellation_model = (
         noise_cancellation.BVCTelephony() if sip_participant else noise_cancellation.BVC()
     )
+    call_state["nc_model"] = "livekit/krisp-bvc-telephony" if sip_participant else "livekit/krisp-bvc"
+    call_state["nc_started_at"] = time.time()
     await session.start(
         room=ctx.room,
         agent=agent,
@@ -1422,6 +1669,21 @@ def prewarm(proc):
     proc.userdata["vad"] = silero.VAD.load()
 
 
+# Module-level AgentServer: `lk agent start`/`lk agent deploy` import this
+# file and look for an AgentServer instance at module scope (preferably
+# named `server`) rather than executing it as a script — they never reach
+# the `if __name__ == "__main__":` block below, so the entrypoint/prewarm
+# registration has to happen here, unconditionally, on import.
+#
+# agent_name="Mary" is required because the SIP dispatch rule
+# (roomConfig.agents: [{"agentName": "Mary"}]) uses explicit/named
+# dispatch. Without a matching agent_name here, this worker only registers
+# for automatic dispatch and never receives jobs from that rule — the
+# dispatch name below must match the dispatch rule exactly.
+server = AgentServer(setup_fnc=prewarm)
+server.rtc_session(entrypoint, agent_name="Mary")
+
+
 if __name__ == "__main__":
     # STT and LLM run through LiveKit Inference, billed via your LiveKit
     # Cloud account — no DEEPGRAM_API_KEY/GOOGLE_API_KEY/OPENAI_API_KEY
@@ -1432,12 +1694,4 @@ if __name__ == "__main__":
     # LIVEKIT_API_KEY/LIVEKIT_API_SECRET + AZURE_SPEECH_KEY/
     # AZURE_SPEECH_REGION + ELEVENLABS_API_KEY (+ Firebase creds for call
     # recording, unrelated to voice AI billing).
-    #
-    # agent_name="Mary" is required because the SIP dispatch rule
-    # (roomConfig.agents: [{"agentName": "Mary"}]) uses explicit/named
-    # dispatch. Without a matching agent_name here, this worker only
-    # registers for automatic dispatch and never receives jobs from that
-    # rule — the dispatch name below must match the dispatch rule exactly.
-    cli.run_app(
-        WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm, agent_name="Mary")
-    )
+    cli.run_app(server)
