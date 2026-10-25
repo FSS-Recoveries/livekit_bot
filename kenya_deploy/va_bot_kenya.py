@@ -518,7 +518,21 @@ async def set_active_language(ctx: RunContext, language: str) -> str:
     )
 )
 async def end_call(ctx: RunContext) -> None:
-    await ctx.wait_for_playout()
+    # Bounded, not a bare await: a real console reproduction (Oct 2026,
+    # testing the false-interruption-resume change) showed that if a
+    # stray noise/VAD blip "falsely interrupts" this closing message right
+    # as end_call runs, resume_false_interruption pauses the audio output
+    # and schedules a resume rather than finishing the generation outright
+    # -- wait_for_playout() blocks on that same generation, and in that
+    # capture it never resolved at all (no "tools execution completed" for
+    # this call, ever, in the log). Rather than depend on that pause/resume
+    # cycle always settling cleanly, give it a generous but bounded window;
+    # past it, shut down anyway -- a closing message that's already mostly
+    # played is far better than a call stuck open indefinitely.
+    try:
+        await asyncio.wait_for(ctx.wait_for_playout(), timeout=_END_CALL_PLAYOUT_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        print("[end_call] wait_for_playout timed out; shutting down anyway")
     job_ctx = get_job_context()
     job_ctx.shutdown(reason="call ended by agent")
     asyncio.create_task(_ensure_call_ends(job_ctx))
@@ -535,6 +549,13 @@ async def end_call(ctx: RunContext) -> None:
 # case the stall (or the retry itself) was transient.
 _END_CALL_RETRY_DELAY_SECONDS = 5
 _END_CALL_MAX_RETRIES = 3
+# Bounds end_call's own wait_for_playout() -- see that function's comment.
+# Generous: a closing message is always short (1-2 sentences per the
+# prompt's own length rule), and false_interruption_timeout (1.5s) plus
+# normal TTS latency should resolve well inside this even through one
+# pause/resume cycle. Exists purely as a ceiling against that cycle not
+# resolving at all, not a value expected to be hit in the normal case.
+_END_CALL_PLAYOUT_TIMEOUT_SECONDS = 15
 
 
 async def _ensure_call_ends(job_ctx: JobContext) -> None:
