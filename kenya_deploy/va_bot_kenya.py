@@ -1852,6 +1852,14 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             print(f"Failed to speak max-call-duration closing line: {e}")
         ctx.shutdown(reason="max call duration (6 min) reached")
+        # Same retry-enforced hangup as the two silence-shutdown paths and
+        # end_call() -- this closing line is allow_interruptions=False, so
+        # it can't get stuck via the false-interruption pause/resume bug
+        # specifically, but ctx.shutdown() still only *starts* a teardown
+        # that could stall for some other reason, and a 6-minute call that
+        # fails to disconnect is exactly the kind of thing worth guarding
+        # against directly rather than hoping it doesn't happen.
+        asyncio.create_task(_ensure_call_ends(ctx))
 
     max_duration_task = asyncio.create_task(_enforce_max_call_duration())
 
