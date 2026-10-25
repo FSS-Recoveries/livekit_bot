@@ -422,6 +422,39 @@ async def _fetch_customer_snapshot(phone_number: str) -> dict:
     return resp.json()
 
 
+_CURRENCY_FIELDS_TO_ROUND = (
+    "final_balance",
+    "total_disbursement_amount",
+    "total_discount1",
+    "total_discount2",
+    "total_discount3",
+    "total_penalty_waiver",
+)
+
+
+def _round_currency_fields(data: dict) -> dict:
+    """Returns a copy of the customer_snapshot response with active_lead's
+    currency fields rounded to the nearest whole shilling. The API can
+    return amounts with cents (e.g. 45234.98) -- nobody needs to hear
+    ".98" read aloud on a call, and the prompt's "speak amounts in full
+    words" rule gets needlessly long and harder to parse by ear for a
+    precise, non-round figure (Tobe's feedback, Oct 2026). This rounds
+    the actual amount Shanice speaks, not just its presentation -- the
+    cents-level difference is immaterial to the real debt. Only the known
+    currency fields are touched; dates, day-counts, ids, and phone
+    numbers elsewhere in active_lead pass through unchanged.
+    """
+    active_lead = data.get("active_lead")
+    if not isinstance(active_lead, dict):
+        return data
+    rounded_lead = dict(active_lead)
+    for field in _CURRENCY_FIELDS_TO_ROUND:
+        value = rounded_lead.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            rounded_lead[field] = round(value)
+    return {**data, "active_lead": rounded_lead}
+
+
 @function_tool(
     description=(
         "Get customer info from the API endpoint once the caller's phone number is available. "
@@ -443,6 +476,7 @@ async def get_customer_info(ctx: RunContext, phone_number: str) -> str:
     try:
         data = await _fetch_customer_snapshot(phone_number)
         print(f"[tool] get_customer_info took {time.time() - _t0:.2f}s")
+        data = _round_currency_fields(data)
         active_lead = data.get("active_lead") or {}
         first_name = active_lead.get("first_name", "")
         last_name = active_lead.get("surname", "")
@@ -1917,6 +1951,7 @@ async def entrypoint(ctx: JobContext):
             return
         if not customer_data:
             return
+        customer_data = _round_currency_fields(customer_data)
         active_lead = customer_data.get("active_lead") or {}
         enriched_prompt = system_prompt + (
             f"\n\nThe customer has already been identified as "
