@@ -1665,6 +1665,14 @@ async def entrypoint(ctx: JobContext):
     async def _shutdown_after_silence() -> None:
         await asyncio.sleep(SILENCE_SHUTDOWN_DELAY_SECONDS)
         ctx.shutdown(reason="no response after silence check")
+        # Same retry-enforced hangup end_call() already gets -- see
+        # _ensure_call_ends and _force_shutdown_after_extended_silence's
+        # docstring below. ctx.shutdown() only starts an async teardown; if
+        # that stalls (a false-interruption pause/resume on the check-in
+        # line that never cleanly resolves, same class of issue end_call's
+        # own wait_for_playout bound was added for), the call stays open
+        # with nothing anyone can do about it from the customer's end.
+        asyncio.create_task(_ensure_call_ends(ctx))
 
     async def _force_shutdown_after_extended_silence() -> None:
         """Absolute ceiling on top of _shutdown_after_silence's per-blip
@@ -1689,6 +1697,14 @@ async def entrypoint(ctx: JobContext):
         """
         await asyncio.sleep(SILENCE_HARD_CAP_SECONDS)
         ctx.shutdown(reason="no real response after extended silence (hard cap)")
+        # A real call (LiFWzKJDfTTK, Oct 2026) ran to 178s despite this
+        # ceiling -- strongly suggesting ctx.shutdown() fired on schedule
+        # (per this function's own design, it should have, around the 62s
+        # mark) but the teardown it only *starts* never completed. Same
+        # retry-enforced hangup end_call() already has, for the same
+        # reason: a stalled teardown must not mean a call that stays open
+        # indefinitely.
+        asyncio.create_task(_ensure_call_ends(ctx))
 
     def _on_user_input_transcribed(ev) -> None:
         # Diagnostic logging (STT/turn-detection reliability investigation,
