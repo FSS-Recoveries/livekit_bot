@@ -550,12 +550,20 @@ async def end_call(ctx: RunContext) -> None:
 _END_CALL_RETRY_DELAY_SECONDS = 5
 _END_CALL_MAX_RETRIES = 3
 # Bounds end_call's own wait_for_playout() -- see that function's comment.
-# Generous: a closing message is always short (1-2 sentences per the
-# prompt's own length rule), and false_interruption_timeout (1.5s) plus
-# normal TTS latency should resolve well inside this even through one
-# pause/resume cycle. Exists purely as a ceiling against that cycle not
-# resolving at all, not a value expected to be hit in the normal case.
-_END_CALL_PLAYOUT_TIMEOUT_SECONDS = 15
+# Raised from 15 to 30 (Oct 2026): a real call (oqxx5Fez7QDZ, Tobe
+# testing an adversarial/difficult exchange) got cut off mid-sentence
+# during a longer English escalation-consequence closing line -- this
+# ceiling firing and forcing the shutdown through before a legitimately
+# long (not stuck) closing message had finished playing. The prompt's
+# usual 1-2 sentence length rule doesn't always hold for a dead-end
+# closing line explaining real consequences, and TTS generation has been
+# observed running slow under load ("flush audio emitter due to slow
+# audio generation" firing repeatedly even on healthy calls tonight).
+# Safe to loosen now that CALL_STALL_RECOVERY_SECONDS/GIVEUP_SECONDS
+# above provide a second, independent backstop against a genuinely stuck
+# call -- this value only needs to guard end_call's own wait, not be the
+# only thing standing between a stall and an open line.
+_END_CALL_PLAYOUT_TIMEOUT_SECONDS = 30
 
 
 async def _ensure_call_ends(job_ctx: JobContext) -> None:
