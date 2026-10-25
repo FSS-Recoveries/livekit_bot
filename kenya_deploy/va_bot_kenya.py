@@ -778,7 +778,23 @@ def build_azure_tts(voice: str | None = None):
     """
     resolved = voice or os.getenv("AZURE_TTS_VOICE", "en-KE-AsiliaNeural")
     tts_cls = _SwahiliAwareAzureTTS if resolved.startswith("sw-") else azure.TTS
-    return tts_cls(voice=resolved)
+    # Azure's plugin is non-streaming (TTSCapabilities(streaming=False) in
+    # azure/tts.py, confirmed against both the installed version and the
+    # latest release) -- it must finish synthesizing a whole reply before
+    # any of it can play. StreamAdapter is LiveKit's own first-party fix for
+    # exactly this: it tokenizes the LLM's streamed output into sentences
+    # and calls the wrapped TTS per sentence, so sentence 1 can start
+    # playing while sentence 2 is still synthesizing, instead of the
+    # customer hearing nothing until the entire multi-sentence reply is
+    # done. text_pacing left at its default (False/off) rather than
+    # SentenceStreamPacer -- that batches multiple sentences into fewer,
+    # larger TTS calls for quality/interruption-cost reasons, the opposite
+    # of what we want here: every sentence flushed as soon as it's
+    # tokenized, to get audio starting as early as possible. Stacks with
+    # preemptive_tts (turn_handling, below) -- that controls *when*
+    # synthesis starts relative to turn confirmation, this controls how
+    # much has to finish synthesizing before anything can play.
+    return agents_tts.StreamAdapter(tts=tts_cls(voice=resolved))
 
 
 # ── SIP participant + caller phone number ────────────────────────────────
@@ -826,8 +842,17 @@ GREETING_WAV_PATH = os.path.join(os.getcwd(), "Greeting.wav")
 # info / AMD still resolving).
 GREETING_V2_WAV_PATH = os.path.join(os.getcwd(), "Greeting v2.wav")
 OPENING_STALL_DELAY_SECONDS = 3
+# Thinking filler: a raw pre-recorded clip, not synthesized via session.say()
+# at call time. It used to go through Azure TTS, which (even wrapped in
+# StreamAdapter) still has a real connection/synthesis round-trip -- the real
+# reply would often finish and cancel the filler task before that round-trip
+# ever produced audible sound, which is almost certainly why it wasn't
+# audibly firing in real calls despite the timer running. A static clip has
+# no synthesis step to race, so once the delay below elapses it plays
+# immediately.
+HMM_WAV_PATH = os.path.join(os.getcwd(), "Hmm.wav")
 # From the agent's first real turn onward, how long it can sit "thinking"
-# before speaking a short "Hmm" filler while the real reply keeps loading.
+# before playing the Hmm filler while the real reply keeps loading.
 HMM_FILLER_DELAY_SECONDS = 3
 # How long to wait after the "Are you still with me?" check-in before
 # giving up and hanging up, if the caller still hasn't responded.
@@ -1150,7 +1175,27 @@ async def entrypoint(ctx: JobContext):
     # default below, since real call data shows voicemail/IVR menu prompts
     # ("Press one to save...") are consistently in English -- unrelated to
     # which language we open the actual conversation in.
-    stt = stt_by_language["english"]
+    #
+    # cartesia/ink-whisper rather than stt_by_language["english"]'s
+    # ElevenLabs+OpenAI pair: LiveKit's own published AMD benchmark
+    # (livekit.com/blog/answering-machine-detection) measured this exact
+    # pairing with google/gemini-3.1-flash-lite (already AMD's llm below) at
+    # a median 840ms time-to-detection, F1 ~94.7-98.2% -- a month of Kenya
+    # call data showed AMD resolving quickly on only ~13% of calls and
+    # running out the clock on ~70%, nowhere near that benchmark, and the
+    # English+ElevenLabs/OpenAI pairing was never itself benchmarked for
+    # this use case, just reused from the main conversation's language-pinned
+    # STT builder. Priced the same or cheaper than the pair it replaces
+    # ($0.003/min vs ElevenLabs scribe_v2_realtime's ~$0.0065/min), billed
+    # through the same LiveKit Cloud account -- no separate sign-up.
+    # fallback="deepgram/nova-3": inference.STT has its own native fallback
+    # param, no FallbackAdapter needed. deepgram/nova-3 is one of the other
+    # two models in AMD's own EVALUATED_STT_MODELS set (alongside
+    # cartesia/ink-whisper and assemblyai/universal-streaming-multilingual)
+    # -- LiveKit's own AMD-tested options, not an arbitrary pick -- so a
+    # cartesia outage still has a benchmarked fallback rather than none.
+    # Test value pending Diana validating detection quality on live calls.
+    stt = inference.STT("cartesia/ink-whisper", language="en", fallback="deepgram/nova-3")
     # The conversation itself now opens in Swahili by default per the
     # Language Selection Rule -- see set_active_language and the Opening
     # the Call section. Kept separate from `stt` above so AMD's own
@@ -1302,7 +1347,19 @@ async def entrypoint(ctx: JobContext):
         # rather than lowering further.
         turn_handling={
             "turn_detection": TurnDetector(),
-            "preemptive_generation": {"enabled": True},
+            # preemptive_tts: Azure's TTS plugin is non-streaming (confirmed
+            # against both the installed version and the latest release —
+            # TTSCapabilities(streaming=False) in azure/tts.py) — it must
+            # finish synthesizing a whole reply before any of it can play.
+            # Without this, that synthesis only starts after the customer's
+            # turn is confirmed over, landing entirely as dead air on top of
+            # LLM generation time. With it, synthesis starts speculatively
+            # on a likely-final interim transcript, overlapping with the
+            # remaining confirmation window instead of adding to it. Test
+            # value pending Diana validating on a live call — tradeoff is a
+            # small amount of wasted synthesis (cost, not correctness) if a
+            # speculative guess is wrong and the customer keeps talking.
+            "preemptive_generation": {"enabled": True, "preemptive_tts": True},
             "interruption": {
                 "mode": "adaptive",
                 "min_words": 2,
@@ -1441,11 +1498,11 @@ async def entrypoint(ctx: JobContext):
 
     async def _speak_hmm_after_delay() -> None:
         await asyncio.sleep(HMM_FILLER_DELAY_SECONDS)
-        # add_to_chat_ctx=False: this is a stalling interjection, not real
-        # dialogue — it must never enter the LLM's own conversation history,
-        # and if TTS happens to be down when this fires, it must not leave a
-        # phantom "assistant said this" line in the transcript either.
-        session.say("Hmm?", allow_interruptions=True, add_to_chat_ctx=False)
+        # Raw-track playback (like the opening greeting), not session.say() --
+        # bypasses TTS/session auto-reply entirely, so it never enters the
+        # LLM's conversation history and there's no synthesis round-trip left
+        # to race against the real reply arriving first. See HMM_WAV_PATH.
+        await _play_wav_greeting(ctx.room, HMM_WAV_PATH)
 
     def _on_agent_state_changed(ev) -> None:
         nonlocal first_response_delivered, opening_stall_task, hmm_filler_task
@@ -1797,15 +1854,35 @@ async def entrypoint(ctx: JobContext):
         # whole window: if the agent still hasn't spoken for real 6s after
         # the WAV finishes, it plays a second bridge clip.
         #
-        # `wait_until_finished=False` caps detection at the 20s timeout even
-        # if the caller talks continuously without a clean pause —
-        # otherwise AMD extends indefinitely waiting for silence.
+        # `wait_until_finished=False` caps detection at the configured
+        # timeout even if the caller talks continuously without a clean
+        # pause — otherwise AMD extends indefinitely waiting for silence.
+        #
+        # timeout=8.0 (SDK default is 20.0): a month of Kenya + Nigeria call
+        # data showed this ceiling is almost never the thing that actually
+        # catches a machine — real voicemail/IVR hits are rare (~0.3% of
+        # Nigeria calls in Oct; zero in Kenya's 852, plausible at that same
+        # low rate) — while the full 20s wait was the *normal* outcome, not
+        # the exception: 70% of Kenya calls and 43% of Nigeria calls timed
+        # out to "uncertain" rather than resolving quickly, each one costing
+        # the caller up to 20s of near-dead air before Shanice ever says
+        # anything substantive. The fast path for a clear, continuously
+        # speaking human (human_speech_threshold/human_silence_threshold in
+        # the SDK's AMD classifier) resolves in roughly a second regardless
+        # of this ceiling, so lowering it only cuts the worst-case wait on
+        # the ambiguous/slow-to-resolve calls that were paying the full
+        # price for a real-machine catch rate that, in practice, is low
+        # single digits per thousand. See the Voicemail-Style Greeting
+        # addition in prompt_kenya.txt's Dead-End Exit Rules for the
+        # non-blocking backstop that now covers what a shorter ceiling may
+        # miss. Test value pending Diana validating on a live call.
         async with AMD(
             session,
             llm=llm,
             stt=stt,
             suppress_compatibility_warning=True,
             wait_until_finished=False,
+            detection_options={"timeout": 8.0},
         ) as detector:
             await _play_wav_greeting(ctx.room, GREETING_WAV_PATH)
             opening_stall_task = asyncio.create_task(_play_opening_stall_after_delay())
