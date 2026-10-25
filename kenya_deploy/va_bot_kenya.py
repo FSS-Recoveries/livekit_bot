@@ -799,12 +799,27 @@ _SWAHILI_TTS_ENGLISH_PATTERN = re.compile(
     r"\b(" + "|".join(re.escape(t) for t in _SWAHILI_TTS_ENGLISH_TERMS) + r")\b",
     re.IGNORECASE,
 )
+# Amounts are spoken as digits now, not spelled-out Swahili number words
+# (Tobe's feedback, Oct 2026: English digit-reading is clearer than full
+# Swahili number phrasing for many listeners, and it's also deterministic
+# -- the TTS engine's own number-reading handles "hundred"/"thousand"
+# correctly instead of depending on the LLM to spell it out right every
+# time). "shilingi"/"shillings" itself stays in the active language; only
+# the digit group gets English pronunciation. Confirmed by direct test:
+# tagging a bare digit group the same way as the word list above makes
+# Azure read it as a correct full English number within the Swahili
+# sentence, "hundred" included.
+_SWAHILI_TTS_DIGIT_PATTERN = re.compile(r"\b\d[\d,]*\b")
 
 
 def _tag_english_loanwords(text: str) -> str:
-    return _SWAHILI_TTS_ENGLISH_PATTERN.sub(
+    text = _SWAHILI_TTS_ENGLISH_PATTERN.sub(
         lambda m: f'<lang xml:lang="en-KE">{m.group(0)}</lang>', text
     )
+    text = _SWAHILI_TTS_DIGIT_PATTERN.sub(
+        lambda m: f'<lang xml:lang="en-KE">{m.group(0)}</lang>', text
+    )
+    return text
 
 
 class _SwahiliAwareAzureTTS(azure.TTS):
