@@ -875,6 +875,15 @@ HMM_WAV_PATH = os.path.join(os.getcwd(), "Hmm.wav")
 # From the agent's first real turn onward, how long it can sit "thinking"
 # before playing the Hmm filler while the real reply keeps loading.
 HMM_FILLER_DELAY_SECONDS = 3
+# Opening-window watchdog: a hard guarantee against the first real line
+# never arriving at all (real calls -- dM3LRP8okMn7, T6S9FmuCvuyV,
+# LsrukSBzBy5A -- showed 2-3+ minutes of total silence after the opening
+# filler with nothing ever logged). Generous relative to the normal
+# ~8-16s opening, well short of those failures. See _opening_watchdog.
+OPENING_WATCHDOG_SECONDS = 20
+OPENING_WATCHDOG_FINAL_SECONDS = 15
+OPENING_RECOVERY_WAV_PATH = os.path.join(os.getcwd(), "OpeningRecovery.wav")
+OPENING_GIVEUP_WAV_PATH = os.path.join(os.getcwd(), "OpeningGiveUp.wav")
 # How long to wait after the "Are you still with me?" check-in before
 # giving up and hanging up, if the caller still hasn't responded.
 SILENCE_SHUTDOWN_DELAY_SECONDS = 10
@@ -963,6 +972,7 @@ async def entrypoint(ctx: JobContext):
     egress_task = asyncio.create_task(_start_call_recording(ctx))
     max_duration_task: asyncio.Task | None = None
     opening_stall_task: asyncio.Task | None = None
+    opening_watchdog_task: asyncio.Task | None = None
     hmm_filler_task: asyncio.Task | None = None
     silence_shutdown_task: asyncio.Task | None = None
     silence_hard_cap_task: asyncio.Task | None = None
@@ -987,6 +997,8 @@ async def entrypoint(ctx: JobContext):
             max_duration_task.cancel()
         if opening_stall_task is not None:
             opening_stall_task.cancel()
+        if opening_watchdog_task is not None:
+            opening_watchdog_task.cancel()
         if hmm_filler_task is not None:
             hmm_filler_task.cancel()
         if silence_shutdown_task is not None:
@@ -1368,19 +1380,22 @@ async def entrypoint(ctx: JobContext):
         # rather than lowering further.
         turn_handling={
             "turn_detection": TurnDetector(),
-            # preemptive_tts: Azure's TTS plugin is non-streaming (confirmed
-            # against both the installed version and the latest release —
-            # TTSCapabilities(streaming=False) in azure/tts.py) — it must
-            # finish synthesizing a whole reply before any of it can play.
-            # Without this, that synthesis only starts after the customer's
-            # turn is confirmed over, landing entirely as dead air on top of
-            # LLM generation time. With it, synthesis starts speculatively
-            # on a likely-final interim transcript, overlapping with the
-            # remaining confirmation window instead of adding to it. Test
-            # value pending Diana validating on a live call — tradeoff is a
-            # small amount of wasted synthesis (cost, not correctness) if a
-            # speculative guess is wrong and the customer keeps talking.
-            "preemptive_generation": {"enabled": True, "preemptive_tts": True},
+            # preemptive_tts disabled (Oct 2026): real calls (dM3LRP8okMn7,
+            # T6S9FmuCvuyV, LsrukSBzBy5A — Tobe's demo-eve call) showed total
+            # silence for 2-3+ minutes after the opening filler, never
+            # producing a first real line at all. preemptive_tts retries a
+            # speculative generation against a StreamAdapter stream that may
+            # already be mid-flight (StreamAdapter tokenizes into sentences
+            # and manages its own stream state per sentence) -- the most
+            # likely place a stream gets left corrupted or endlessly
+            # retrying with nothing ever flushing to audio, and the common
+            # thread across all the worst failures found so far. StreamAdapter
+            # itself (the proven 2.5s->0.51s first-audio win) doesn't need
+            # preemptive_tts to deliver that -- it chunks sentences as the
+            # LLM streams them in regardless. LLM-side preemptive generation
+            # (enabled=True) stays on; only the TTS half, which is what
+            # actually touches StreamAdapter's state, is turned off.
+            "preemptive_generation": {"enabled": True, "preemptive_tts": False},
             "interruption": {
                 "mode": "adaptive",
                 "min_words": 2,
@@ -1517,6 +1532,45 @@ async def entrypoint(ctx: JobContext):
         await asyncio.sleep(OPENING_STALL_DELAY_SECONDS)
         await _play_wav_greeting(ctx.room, GREETING_V2_WAV_PATH)
 
+    async def _opening_watchdog() -> None:
+        """Hard guarantee against the first real line never arriving at
+        all -- see OPENING_WATCHDOG_SECONDS above for the real calls that
+        motivated this (2-3+ minutes of total silence, nothing ever
+        logged). First tier: force-interrupt whatever generation may be
+        stuck, play a raw-track recovery clip (bypasses TTS/StreamAdapter
+        entirely, so it can't get stuck the same way), and force a fresh
+        generate_reply() attempt. Second tier, if that still produces
+        nothing: give up cleanly with an apology clip and hang up, rather
+        than leave the line silently open indefinitely.
+        """
+        await asyncio.sleep(OPENING_WATCHDOG_SECONDS)
+        if first_response_delivered:
+            return
+        print("[opening_watchdog] no first response after watchdog window; attempting recovery")
+        try:
+            await session.interrupt(force=True)
+        except Exception as e:
+            print(f"[opening_watchdog] interrupt failed: {e}")
+        try:
+            await _play_wav_greeting(ctx.room, OPENING_RECOVERY_WAV_PATH)
+        except Exception as e:
+            print(f"[opening_watchdog] recovery clip failed: {e}")
+        try:
+            session.generate_reply()
+        except Exception as e:
+            print(f"[opening_watchdog] generate_reply failed: {e}")
+
+        await asyncio.sleep(OPENING_WATCHDOG_FINAL_SECONDS)
+        if first_response_delivered:
+            return
+        print("[opening_watchdog] still no first response after recovery attempt; giving up")
+        try:
+            await _play_wav_greeting(ctx.room, OPENING_GIVEUP_WAV_PATH)
+        except Exception as e:
+            print(f"[opening_watchdog] giveup clip failed: {e}")
+        ctx.shutdown(reason="no response generated within startup window")
+        asyncio.create_task(_ensure_call_ends(ctx))
+
     async def _speak_hmm_after_delay() -> None:
         await asyncio.sleep(HMM_FILLER_DELAY_SECONDS)
         # Raw-track playback (like the opening greeting), not session.say() --
@@ -1526,7 +1580,7 @@ async def entrypoint(ctx: JobContext):
         await _play_wav_greeting(ctx.room, HMM_WAV_PATH)
 
     def _on_agent_state_changed(ev) -> None:
-        nonlocal first_response_delivered, opening_stall_task, hmm_filler_task
+        nonlocal first_response_delivered, opening_stall_task, opening_watchdog_task, hmm_filler_task
         # Diagnostic logging (STT/turn-detection reliability investigation,
         # Aug 2026) — correlates against [user_state]/[stt] log lines to see
         # exactly what the agent was doing when a turn should have landed.
@@ -1536,6 +1590,8 @@ async def entrypoint(ctx: JobContext):
                 first_response_delivered = True
                 if opening_stall_task is not None and not opening_stall_task.done():
                     opening_stall_task.cancel()
+                if opening_watchdog_task is not None and not opening_watchdog_task.done():
+                    opening_watchdog_task.cancel()
             if hmm_filler_task is not None and not hmm_filler_task.done():
                 hmm_filler_task.cancel()
             # The agent speaking a real reply is itself proof the call is
@@ -1961,7 +2017,13 @@ async def entrypoint(ctx: JobContext):
             # hasn't spoken yet, nothing is queued, and correctly so —
             # opening_stall_task/GREETING_V2_WAV_PATH is the only thing
             # that covers the silence until they do.
-            pass
+            #
+            # opening_watchdog_task is the hard backstop beyond that --
+            # not started for MACHINE_IVR (which has its own navigation
+            # flow; forcing a human-facing generate_reply into that would
+            # be wrong) or the two MACHINE_* branches above (already
+            # shutting down).
+            opening_watchdog_task = asyncio.create_task(_opening_watchdog())
 
     # No keep-alive loop here on purpose. The call's actual lifetime is
     # governed by the job's internal shutdown future (set by ctx.shutdown()
