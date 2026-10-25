@@ -622,6 +622,30 @@ async def _ensure_call_ends(job_ctx: JobContext) -> None:
 _NAIROBI_TZ = ZoneInfo("Africa/Nairobi")
 
 
+def _ordinal_day_suffix(day: int) -> str:
+    if 11 <= day % 100 <= 13:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+
+
+def _format_date_with_ordinal(dt: "datetime", include_time: bool = False) -> str:
+    """Formats a date as e.g. "Monday, November 1st, 2026" -- an ordinal
+    day, not strftime's zero-padded cardinal %d. Dates are spoken aloud
+    on every call (payment deadlines) -- %d produces "November 01",
+    which the digit-tagging fix below (_tag_english_loanwords) would
+    read as a bare cardinal "zero one" or "one", never the correct
+    ordinal "first" a spoken date needs. Writing the ordinal suffix
+    directly (1st, 24th) lets Azure's English number-reading produce
+    the right word on its own, more reliably than spelling "twenty-
+    fourth" out as words ourselves.
+    """
+    suffix = _ordinal_day_suffix(dt.day)
+    date_part = dt.strftime(f"%A, %B {dt.day}{suffix}, %Y")
+    if include_time:
+        return f"{date_part}, {dt.strftime('%I:%M %p')}"
+    return date_part
+
+
 @function_tool(
     description=(
         "Re-check the current date and time in Kenya (Africa/Nairobi, East "
@@ -643,12 +667,12 @@ async def get_current_datetime(ctx: RunContext) -> str:
     seven_day_deadline = now + timedelta(days=7)
     thirty_day_deadline = now + timedelta(days=30)
     return (
-        f"Current date and time: {now.strftime('%A, %B %d, %Y, %I:%M %p')} "
+        f"Current date and time: {_format_date_with_ordinal(now, include_time=True)} "
         f"East Africa Time. ISO date: {now.date().isoformat()}. "
         f"7-day payment deadline (speak this exact date, never 'in 7 days' or "
-        f"'this week'): {seven_day_deadline.strftime('%A, %B %d, %Y')}. "
+        f"'this week'): {_format_date_with_ordinal(seven_day_deadline)}. "
         f"30-day payment deadline (speak this exact date, never 'in 30 days' or "
-        f"'end of month'): {thirty_day_deadline.strftime('%A, %B %d, %Y')}."
+        f"'end of month'): {_format_date_with_ordinal(thirty_day_deadline)}."
     )
 
 
@@ -809,7 +833,7 @@ _SWAHILI_TTS_ENGLISH_PATTERN = re.compile(
 # tagging a bare digit group the same way as the word list above makes
 # Azure read it as a correct full English number within the Swahili
 # sentence, "hundred" included.
-_SWAHILI_TTS_DIGIT_PATTERN = re.compile(r"\b\d[\d,]*\b")
+_SWAHILI_TTS_DIGIT_PATTERN = re.compile(r"\b\d[\d,]*(?:st|nd|rd|th)?\b")
 
 
 def _tag_english_loanwords(text: str) -> str:
@@ -1156,10 +1180,10 @@ async def entrypoint(ctx: JobContext):
         f"\n\nCURRENT DATE CONTEXT (authoritative for this entire call — never "
         f"override with your own sense of today's date, and never do your own "
         f"date arithmetic): today is "
-        f"{_call_start_dt.strftime('%A, %B %d, %Y')}. The 7-day payment "
-        f"deadline is {_seven_day_deadline_dt.strftime('%A, %B %d, %Y')}. The "
+        f"{_format_date_with_ordinal(_call_start_dt)}. The 7-day payment "
+        f"deadline is {_format_date_with_ordinal(_seven_day_deadline_dt)}. The "
         f"30-day payment deadline is "
-        f"{_thirty_day_deadline_dt.strftime('%A, %B %d, %Y')}. These are fixed "
+        f"{_format_date_with_ordinal(_thirty_day_deadline_dt)}. These are fixed "
         f"for the rest of this call — speak them exactly as given here, never "
         f"as 'in 7 days', 'this week', 'in 30 days', or 'end of month'. Only "
         f"call get_current_datetime if the customer disputes today's date or "
