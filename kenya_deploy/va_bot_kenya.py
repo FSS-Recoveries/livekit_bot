@@ -884,6 +884,22 @@ OPENING_WATCHDOG_SECONDS = 20
 OPENING_WATCHDOG_FINAL_SECONDS = 15
 OPENING_RECOVERY_WAV_PATH = os.path.join(os.getcwd(), "OpeningRecovery.wav")
 OPENING_GIVEUP_WAV_PATH = os.path.join(os.getcwd(), "OpeningGiveUp.wav")
+# Call-wide stall watchdog: every existing safety net (silence-shutdown,
+# hard-cap, the hearing-difficulty/repeated-turn backstops) is triggered
+# BY a new event arriving -- a conversation_item being added, a state
+# transition firing. A real call (Diana, jPJczDmcJMiL, Oct 2026) showed
+# the agent say "Uko pale?" mid-conversation and then log nothing else
+# at all for the remaining ~175s of a 230.8s call, until she hung up
+# herself -- consistent with the same underlying stuck-generation/paused-
+# speech issue freezing the state machine those other nets depend on, so
+# none of them ever got the chance to fire. This one is a pure wall-clock
+# check instead: independent of any event, it just asks "how long since
+# the last real conversation item landed, at all" -- see
+# _call_stall_watchdog. Starts once, the first time first_response_delivered
+# flips True; runs for the rest of the call.
+CALL_STALL_CHECK_INTERVAL_SECONDS = 10
+CALL_STALL_RECOVERY_SECONDS = 25
+CALL_STALL_GIVEUP_SECONDS = 45
 # How long to wait after the "Are you still with me?" check-in before
 # giving up and hanging up, if the caller still hasn't responded.
 SILENCE_SHUTDOWN_DELAY_SECONDS = 10
@@ -973,6 +989,9 @@ async def entrypoint(ctx: JobContext):
     max_duration_task: asyncio.Task | None = None
     opening_stall_task: asyncio.Task | None = None
     opening_watchdog_task: asyncio.Task | None = None
+    call_stall_watchdog_task: asyncio.Task | None = None
+    last_progress_at: float = time.time()
+    stall_recovery_attempted_at: float | None = None
     hmm_filler_task: asyncio.Task | None = None
     silence_shutdown_task: asyncio.Task | None = None
     silence_hard_cap_task: asyncio.Task | None = None
@@ -999,6 +1018,8 @@ async def entrypoint(ctx: JobContext):
             opening_stall_task.cancel()
         if opening_watchdog_task is not None:
             opening_watchdog_task.cancel()
+        if call_stall_watchdog_task is not None:
+            call_stall_watchdog_task.cancel()
         if hmm_filler_task is not None:
             hmm_filler_task.cancel()
         if silence_shutdown_task is not None:
@@ -1460,9 +1481,52 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             print(f"Failed to speak hearing-difficulty backstop closing line: {e}")
         ctx.shutdown(reason=reason)
+        # Same retry-enforced hangup as the other shutdown call sites --
+        # see _ensure_call_ends.
+        asyncio.create_task(_ensure_call_ends(ctx))
+
+    async def _call_stall_watchdog() -> None:
+        """Pure wall-clock backstop against the whole call freezing with
+        no new conversation_item ever landing again -- see
+        CALL_STALL_RECOVERY_SECONDS above for why none of the event-driven
+        safety nets can be trusted to catch this on their own. Runs for
+        the rest of the call once started; doesn't care what state the
+        agent/user state machine thinks it's in, only how long it's been
+        since real progress was last confirmed.
+        """
+        nonlocal stall_recovery_attempted_at
+        while True:
+            await asyncio.sleep(CALL_STALL_CHECK_INTERVAL_SECONDS)
+            if ctx.room.connection_state != rtc.ConnectionState.CONN_CONNECTED:
+                return
+            idle = time.time() - last_progress_at
+            if idle >= CALL_STALL_GIVEUP_SECONDS and stall_recovery_attempted_at is not None:
+                print(
+                    f"[call_stall_watchdog] no progress for {idle:.0f}s after "
+                    "recovery attempt; giving up"
+                )
+                try:
+                    await _play_wav_greeting(ctx.room, OPENING_GIVEUP_WAV_PATH)
+                except Exception as e:
+                    print(f"[call_stall_watchdog] giveup clip failed: {e}")
+                ctx.shutdown(reason="call stalled mid-conversation; no response after recovery")
+                asyncio.create_task(_ensure_call_ends(ctx))
+                return
+            elif idle >= CALL_STALL_RECOVERY_SECONDS and stall_recovery_attempted_at is None:
+                print(f"[call_stall_watchdog] no progress for {idle:.0f}s; attempting recovery")
+                stall_recovery_attempted_at = time.time()
+                try:
+                    await session.interrupt(force=True)
+                except Exception as e:
+                    print(f"[call_stall_watchdog] interrupt failed: {e}")
+                try:
+                    session.generate_reply()
+                except Exception as e:
+                    print(f"[call_stall_watchdog] generate_reply failed: {e}")
 
     def _on_conversation_item_added(ev):
         nonlocal hmm_filler_task, consecutive_greeting_only_turns
+        nonlocal last_progress_at, stall_recovery_attempted_at
         nonlocal consecutive_repeated_assistant_turns, last_assistant_utterance
         item = ev.item
         role = getattr(item, "role", None)
@@ -1475,6 +1539,10 @@ async def entrypoint(ctx: JobContext):
             # WHEN a turn does land, for comparison against what was actually
             # said on the recording.
             print(f"[turn] conversation_item_added role={role} text={text!r}")
+            # Real progress, by either party -- resets the call-wide stall
+            # watchdog's clock and clears any in-progress recovery attempt.
+            last_progress_at = time.time()
+            stall_recovery_attempted_at = None
         # Belt-and-suspenders: a real assistant utterance just landed, so any
         # pending "Hmm" filler is moot. Cancelling only on the "speaking"
         # state transition isn't always enough — a slow/chunked TTS
@@ -1581,6 +1649,7 @@ async def entrypoint(ctx: JobContext):
 
     def _on_agent_state_changed(ev) -> None:
         nonlocal first_response_delivered, opening_stall_task, opening_watchdog_task, hmm_filler_task
+        nonlocal call_stall_watchdog_task, last_progress_at
         # Diagnostic logging (STT/turn-detection reliability investigation,
         # Aug 2026) — correlates against [user_state]/[stt] log lines to see
         # exactly what the agent was doing when a turn should have landed.
@@ -1592,6 +1661,8 @@ async def entrypoint(ctx: JobContext):
                     opening_stall_task.cancel()
                 if opening_watchdog_task is not None and not opening_watchdog_task.done():
                     opening_watchdog_task.cancel()
+                last_progress_at = time.time()
+                call_stall_watchdog_task = asyncio.create_task(_call_stall_watchdog())
             if hmm_filler_task is not None and not hmm_filler_task.done():
                 hmm_filler_task.cancel()
             # The agent speaking a real reply is itself proof the call is
