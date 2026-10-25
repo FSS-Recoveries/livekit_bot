@@ -726,7 +726,7 @@ def build_elevenlabs_tts():
 # tag here passes through as real markup rather than being escaped to text.
 # Extend this list as new mispronounced terms turn up.
 _SWAHILI_TTS_ENGLISH_TERMS = [
-    "SMS", "Recoveries", "Recovery", "FSS", "PTP",
+    "SMS", "Recoveries", "Recovery", "FSS", "PTP", "CRB",
     "discount", "balance", "penalty", "waiver", "loan", "WhatsApp",
     "settlement", "branch", "instalment", "installment", "overdue",
     "interest", "repayment", "paybill", "mobile money", "account", "bank",
