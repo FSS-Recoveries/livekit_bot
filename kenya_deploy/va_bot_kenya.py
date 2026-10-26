@@ -1262,6 +1262,21 @@ async def entrypoint(ctx: JobContext):
         """
         return agents_stt.FallbackAdapter(
             [
+                # cartesia/ink-whisper as primary, same engine AMD already
+                # uses below for voicemail/IVR detection -- added here per
+                # explicit instruction to test it on the main conversation
+                # too, not just AMD's classification window. fallback=
+                # covers a cartesia-side outage the same way AMD's own stt
+                # does; ElevenLabs+OpenAI below remain as the FallbackAdapter's
+                # second/third options if this whole entry raises. Streaming
+                # support for Swahili specifically on cartesia's fast tier is
+                # unconfirmed (one competitor claims non-English falls back
+                # to a slower batch path; not corroborated in Cartesia's own
+                # docs) -- this is exactly the live-call test the instruction
+                # asked for.
+                inference.STT(
+                    "cartesia/ink-whisper", language=language_code, fallback="deepgram/nova-3"
+                ),
                 # model="scribe_v2_realtime" already selects realtime mode;
                 # the plugin logs a warning if use_realtime=True is also
                 # passed alongside it (it's simply ignored), so it's left
@@ -1482,6 +1497,21 @@ async def entrypoint(ctx: JobContext):
         # rather than lowering further.
         turn_handling={
             "turn_detection": TurnDetector(),
+            # endpointing.min_delay lowered 0.5 -> 0.35 (TEST, Oct 2026):
+            # min_delay is how long Shanice waits after the turn-detector is
+            # CONFIDENT the customer is done (end_of_turn_probability above
+            # the model's own threshold) before replying -- max_delay (3.0s,
+            # left unchanged) is the separate, longer wait used when it's
+            # NOT confident, so this only shaves latency off turns it was
+            # already sure about, not the uncertain ones. Deliberately not
+            # touching unlikely_threshold/backchannel_threshold themselves:
+            # the SDK logs its own warning that those are server-calibrated
+            # per-language and overriding them "may be suboptimal" -- this
+            # tunes the wait window instead, which carries no such warning.
+            # 0.35 is a moderate first step, not the floor; if live calls
+            # show Shanice clipping the start of a customer's next word, undo
+            # this rather than lowering further.
+            "endpointing": {"min_delay": 0.35},
             # preemptive_tts re-enabled (Oct 2026), after being off for a
             # day: real calls (dM3LRP8okMn7, T6S9FmuCvuyV, Tobe's demo-eve
             # LsrukSBzBy5A) showed total silence for 2-3+ minutes after the
