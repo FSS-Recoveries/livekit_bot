@@ -1579,40 +1579,27 @@ async def entrypoint(ctx: JobContext):
         # rather than lowering further.
         turn_handling={
             "turn_detection": TurnDetector(),
-            # endpointing.min_delay lowered 0.5 -> 0.35 (TEST, Oct 2026):
-            # min_delay is how long Shanice waits after the turn-detector is
-            # CONFIDENT the customer is done (end_of_turn_probability above
-            # the model's own threshold) before replying -- max_delay (3.0s,
-            # left unchanged) is the separate, longer wait used when it's
-            # NOT confident, so this only shaves latency off turns it was
-            # already sure about, not the uncertain ones. Deliberately not
-            # touching unlikely_threshold/backchannel_threshold themselves:
-            # the SDK logs its own warning that those are server-calibrated
-            # per-language and overriding them "may be suboptimal" -- this
-            # tunes the wait window instead, which carries no such warning.
-            # 0.35 is a moderate first step, not the floor; if live calls
-            # show Shanice clipping the start of a customer's next word, undo
-            # this rather than lowering further.
-            "endpointing": {"min_delay": 0.35},
-            # preemptive_tts re-enabled (Oct 2026), after being off for a
-            # day: real calls (dM3LRP8okMn7, T6S9FmuCvuyV, Tobe's demo-eve
-            # LsrukSBzBy5A) showed total silence for 2-3+ minutes after the
-            # opening filler, never producing a first real line at all --
-            # preemptive_tts retrying a speculative generation against a
-            # StreamAdapter stream that may already be mid-flight was the
-            # prime suspect. Re-enabling now that _opening_watchdog and
-            # _call_stall_watchdog exist (neither did when it was first
-            # disabled) -- both are pure wall-clock backstops independent
-            # of what preemptive_tts does internally, so whatever stall
-            # this causes, wherever in the call, gets caught and bounded
-            # rather than running for minutes. Simpler and more robust
-            # than trying to surgically disable it only for the first turn
-            # (mechanically possible by mutating Agent._turn_handling at
-            # runtime, but that's a private attribute, not a supported
-            # API -- not worth the fragility when the watchdogs already
-            # cover the risk generally). Test value pending Diana/Tobe
-            # validating on live calls.
-            "preemptive_generation": {"enabled": True, "preemptive_tts": True},
+            # endpointing.min_delay reverted to the framework default (0.5),
+            # no override (TEST reverted, Oct 2026): lowering it to 0.35
+            # shaved latency off turns the detector was confident about, but
+            # Diana reported Shanice talking over her on a live call right
+            # after this + preemptive_tts went out together -- reverting
+            # both at once rather than isolating which one did it, since
+            # getting back to known-good behavior matters more right now
+            # than isolating blame between the two.
+            #
+            # preemptive_tts disabled again (reverted, Oct 2026): real calls
+            # (dM3LRP8okMn7, T6S9FmuCvuyV, Tobe's demo-eve LsrukSBzBy5A)
+            # originally showed total silence for 2-3+ minutes after the
+            # opening filler with this on -- it was re-enabled on the theory
+            # that _opening_watchdog/_call_stall_watchdog would bound
+            # whatever stall it caused, but Diana's "the delay is back"
+            # report on this same round of calls matches that original
+            # failure mode closely enough that it's not worth re-litigating
+            # here. LLM-side preemptive generation (enabled=True) stays on;
+            # only the TTS half, which is what actually touches
+            # StreamAdapter's state, is turned off again.
+            "preemptive_generation": {"enabled": True, "preemptive_tts": False},
             "interruption": {
                 "mode": "adaptive",
                 "min_words": 2,
