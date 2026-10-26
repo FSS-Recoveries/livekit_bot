@@ -1482,22 +1482,25 @@ async def entrypoint(ctx: JobContext):
         # rather than lowering further.
         turn_handling={
             "turn_detection": TurnDetector(),
-            # preemptive_tts disabled (Oct 2026): real calls (dM3LRP8okMn7,
-            # T6S9FmuCvuyV, LsrukSBzBy5A — Tobe's demo-eve call) showed total
-            # silence for 2-3+ minutes after the opening filler, never
-            # producing a first real line at all. preemptive_tts retries a
-            # speculative generation against a StreamAdapter stream that may
-            # already be mid-flight (StreamAdapter tokenizes into sentences
-            # and manages its own stream state per sentence) -- the most
-            # likely place a stream gets left corrupted or endlessly
-            # retrying with nothing ever flushing to audio, and the common
-            # thread across all the worst failures found so far. StreamAdapter
-            # itself (the proven 2.5s->0.51s first-audio win) doesn't need
-            # preemptive_tts to deliver that -- it chunks sentences as the
-            # LLM streams them in regardless. LLM-side preemptive generation
-            # (enabled=True) stays on; only the TTS half, which is what
-            # actually touches StreamAdapter's state, is turned off.
-            "preemptive_generation": {"enabled": True, "preemptive_tts": False},
+            # preemptive_tts re-enabled (Oct 2026), after being off for a
+            # day: real calls (dM3LRP8okMn7, T6S9FmuCvuyV, Tobe's demo-eve
+            # LsrukSBzBy5A) showed total silence for 2-3+ minutes after the
+            # opening filler, never producing a first real line at all --
+            # preemptive_tts retrying a speculative generation against a
+            # StreamAdapter stream that may already be mid-flight was the
+            # prime suspect. Re-enabling now that _opening_watchdog and
+            # _call_stall_watchdog exist (neither did when it was first
+            # disabled) -- both are pure wall-clock backstops independent
+            # of what preemptive_tts does internally, so whatever stall
+            # this causes, wherever in the call, gets caught and bounded
+            # rather than running for minutes. Simpler and more robust
+            # than trying to surgically disable it only for the first turn
+            # (mechanically possible by mutating Agent._turn_handling at
+            # runtime, but that's a private attribute, not a supported
+            # API -- not worth the fragility when the watchdogs already
+            # cover the risk generally). Test value pending Diana/Tobe
+            # validating on live calls.
+            "preemptive_generation": {"enabled": True, "preemptive_tts": True},
             "interruption": {
                 "mode": "adaptive",
                 "min_words": 2,
