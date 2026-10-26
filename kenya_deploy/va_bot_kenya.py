@@ -563,10 +563,27 @@ async def end_call(ctx: RunContext) -> None:
     # cycle always settling cleanly, give it a generous but bounded window;
     # past it, shut down anyway -- a closing message that's already mostly
     # played is far better than a call stuck open indefinitely.
+    timed_out = False
     try:
         await asyncio.wait_for(ctx.wait_for_playout(), timeout=_END_CALL_PLAYOUT_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
+        timed_out = True
         print("[end_call] wait_for_playout timed out; shutting down anyway")
+    if not timed_out:
+        # Real call (UnwyKXH5QbA8, Oct 2026) confirmed the same pause/resume
+        # race above still bites even without hitting the 30s timeout:
+        # wait_for_playout() resolved quickly, but the closing sentence was
+        # mid-resume from a false-interruption pause at that exact moment --
+        # Whisper's own word timestamps showed the last word cut off
+        # mid-sentence ~1.5s before the recording ended, with the resumed
+        # tail never actually reaching the room. wait_for_playout()
+        # apparently considers a paused-but-not-yet-resumed generation
+        # "done" rather than waiting for the resume to actually flush audio.
+        # A short fixed grace window here is cheap insurance against exactly
+        # that gap -- negligible added latency on the vast majority of
+        # calls where nothing raced, and the difference between a clean
+        # goodbye and a cut-off one on the calls where it did.
+        await asyncio.sleep(_END_CALL_GRACE_SECONDS)
     job_ctx = get_job_context()
     job_ctx.shutdown(reason="call ended by agent")
     asyncio.create_task(_ensure_call_ends(job_ctx))
@@ -598,6 +615,11 @@ _END_CALL_MAX_RETRIES = 3
 # call -- this value only needs to guard end_call's own wait, not be the
 # only thing standing between a stall and an open line.
 _END_CALL_PLAYOUT_TIMEOUT_SECONDS = 30
+# Added grace window after a successful (non-timeout) wait_for_playout() --
+# see end_call's comment. 2s comfortably covers the ~1.5s gap confirmed on
+# a real call (UnwyKXH5QbA8) between the closing message's last audible
+# word and the recording ending mid-sentence.
+_END_CALL_GRACE_SECONDS = 2.0
 
 
 async def _ensure_call_ends(job_ctx: JobContext) -> None:
