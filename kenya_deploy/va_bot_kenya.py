@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
 import os
-import random
 import re
 import requests
 import inspect
@@ -968,63 +967,6 @@ OPENING_RECOVERY_WAV_PATH = os.path.join(os.getcwd(), "OpeningRecovery.wav")
 OPENING_GIVEUP_WAV_PATH = os.path.join(os.getcwd(), "OpeningGiveUp.wav")
 
 
-# ── Agent persona (voice + name) ─────────────────────────────────────────
-# Two personas, randomly picked per call (see entrypoint), to split-test
-# whether a male voice performs any differently from Shanice on real calls.
-# Both are genuine en-KE/sw-KE locale voices -- Azure only ships one female
-# and one male neural voice per Kenyan locale (confirmed via a direct query
-# of the account's available voices), so Francis isn't a workaround or a
-# different accent, just the other half of the same pair Shanice already
-# uses. Everything persona-specific lives here: the two Azure voices, and
-# the five pre-recorded WAVs that bypass TTS entirely (see each one's own
-# comment above) re-recorded in Francis's voice so neither persona ever
-# plays a clip in the other's voice.
-class _Persona:
-    def __init__(
-        self,
-        name: str,
-        english_voice: str,
-        swahili_voice: str,
-        greeting_wav: str,
-        greeting_v2_wav: str,
-        hmm_wav: str,
-        opening_recovery_wav: str,
-        opening_giveup_wav: str,
-    ):
-        self.name = name
-        self.english_voice = english_voice
-        self.swahili_voice = swahili_voice
-        self.greeting_wav = greeting_wav
-        self.greeting_v2_wav = greeting_v2_wav
-        self.hmm_wav = hmm_wav
-        self.opening_recovery_wav = opening_recovery_wav
-        self.opening_giveup_wav = opening_giveup_wav
-
-
-PERSONAS = [
-    _Persona(
-        name="Shanice",
-        english_voice="en-KE-AsiliaNeural",
-        swahili_voice="sw-KE-ZuriNeural",
-        greeting_wav=GREETING_WAV_PATH,
-        greeting_v2_wav=GREETING_V2_WAV_PATH,
-        hmm_wav=HMM_WAV_PATH,
-        opening_recovery_wav=OPENING_RECOVERY_WAV_PATH,
-        opening_giveup_wav=OPENING_GIVEUP_WAV_PATH,
-    ),
-    _Persona(
-        name="Francis",
-        english_voice="en-KE-ChilembaNeural",
-        swahili_voice="sw-KE-RafikiNeural",
-        greeting_wav=os.path.join(os.getcwd(), "Francis Greeting.wav"),
-        greeting_v2_wav=os.path.join(os.getcwd(), "Francis Greeting v2.wav"),
-        hmm_wav=os.path.join(os.getcwd(), "Francis Hmm.wav"),
-        opening_recovery_wav=os.path.join(os.getcwd(), "Francis OpeningRecovery.wav"),
-        opening_giveup_wav=os.path.join(os.getcwd(), "Francis OpeningGiveUp.wav"),
-    ),
-]
-
-
 # Call-wide stall watchdog: every existing safety net (silence-shutdown,
 # hard-cap, the hearing-difficulty/repeated-turn backstops) is triggered
 # BY a new event arriving -- a conversation_item being added, a state
@@ -1108,22 +1050,6 @@ async def entrypoint(ctx: JobContext):
     print(f"Connected to room {ctx.room.name}")
 
     is_console = ctx.room.name == "console" or ctx.room.name.startswith("console-")
-
-    # Persona: randomly Shanice or Francis for this call, see PERSONAS above.
-    # Reassigning the same names the module-level WAV constants use (rather
-    # than threading a new variable name through every _play_wav_greeting
-    # call below) is deliberate -- every existing usage of GREETING_WAV_PATH
-    # etc. further down in this function already closes over whichever
-    # value these names hold at call time, so this is the only line that
-    # needs to change for the whole opening/watchdog/filler flow to switch
-    # personas; nothing below this needed touching.
-    persona = random.choice(PERSONAS)
-    print(f"Persona for this call: {persona.name}")
-    GREETING_WAV_PATH = persona.greeting_wav
-    GREETING_V2_WAV_PATH = persona.greeting_v2_wav
-    HMM_WAV_PATH = persona.hmm_wav
-    OPENING_RECOVERY_WAV_PATH = persona.opening_recovery_wav
-    OPENING_GIVEUP_WAV_PATH = persona.opening_giveup_wav
 
     # Call recording + transcript storage (Firebase). Kicked off as a
     # background task (not awaited here) so the network round-trip to the
@@ -1231,19 +1157,13 @@ async def entrypoint(ctx: JobContext):
         if phone_number:
             lookup_task = asyncio.create_task(_fetch_customer_snapshot(phone_number))
 
-    # Load system prompt (fallback if file missing). prompt_kenya.txt is
-    # written with "Shanice" as the literal name throughout -- swapped to
-    # the persona chosen above via a plain string replace, since every
-    # occurrence really is just that literal name (no gendered pronouns or
-    # grammar tied to it; confirmed by reading every "Shanice"/"she"/"her"
-    # reference in the file).
+    # Load system prompt (fallback if file missing)
     prompt_path = os.path.join(os.getcwd(), "prompt_kenya.txt")
     try:
         with open(prompt_path, "r", encoding="utf-8") as f:
             system_prompt = f.read().strip()
     except FileNotFoundError:
-        system_prompt = f"You are {persona.name}, a debt collection assistant."
-    system_prompt = system_prompt.replace("Shanice", persona.name)
+        system_prompt = "You are Shanice, a debt collection assistant."
 
     # Ground the model in the real current date via code, not tool-call
     # discipline. Ported from va_bot.py: the model was observed relying on
@@ -1354,7 +1274,7 @@ async def entrypoint(ctx: JobContext):
                 # truncating and garbling Swahili customer speech ("Ioneda
                 # lupa Ioneda tafutani lupa" for what Whisper correctly heard
                 # as "E, iyo naiza lipa. Iyo naiza tafuta nilipe"). That's
-                # what was actually behind Francis re-asking the same
+                # what was actually behind the agent re-asking the same
                 # question three times on that call -- the LLM was
                 # legitimately failing to parse genuinely garbled input, not
                 # a turn-scheduling bug. Reverted back to the
@@ -1506,11 +1426,11 @@ async def entrypoint(ctx: JobContext):
     # on the first failure avoids that overlap.
     tts_by_language = {
         "english": agents_tts.FallbackAdapter(
-            [build_azure_tts(voice=persona.english_voice), build_elevenlabs_tts()],
+            [build_azure_tts(voice="en-KE-AsiliaNeural"), build_elevenlabs_tts()],
             max_retry_per_tts=0,
         ),
         "swahili": agents_tts.FallbackAdapter(
-            [build_azure_tts(voice=persona.swahili_voice), build_elevenlabs_tts()],
+            [build_azure_tts(voice="sw-KE-ZuriNeural"), build_elevenlabs_tts()],
             max_retry_per_tts=0,
         ),
     }
