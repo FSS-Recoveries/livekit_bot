@@ -1344,21 +1344,26 @@ async def entrypoint(ctx: JobContext):
         """
         return agents_stt.FallbackAdapter(
             [
-                # cartesia/ink-whisper as primary, same engine AMD already
-                # uses below for voicemail/IVR detection -- added here per
-                # explicit instruction to test it on the main conversation
-                # too, not just AMD's classification window. fallback=
-                # covers a cartesia-side outage the same way AMD's own stt
-                # does; ElevenLabs+OpenAI below remain as the FallbackAdapter's
-                # second/third options if this whole entry raises. Streaming
-                # support for Swahili specifically on cartesia's fast tier is
-                # unconfirmed (one competitor claims non-English falls back
-                # to a slower batch path; not corroborated in Cartesia's own
-                # docs) -- this is exactly the live-call test the instruction
-                # asked for.
-                inference.STT(
-                    "cartesia/ink-whisper", language=language_code, fallback="deepgram/nova-3"
-                ),
+                # cartesia/ink-whisper as primary (TEST, reverted Oct 2026):
+                # tried here as the main-conversation STT, same engine AMD
+                # already uses for voicemail/IVR detection. Live-call test
+                # confirmed exactly the risk flagged when this went in --
+                # pulling the raw [stt] log lines for a real Swahili call
+                # (UnwyKXH5QbA8) side by side with a Whisper ground-truth
+                # transcript of the same audio showed cartesia consistently
+                # truncating and garbling Swahili customer speech ("Ioneda
+                # lupa Ioneda tafutani lupa" for what Whisper correctly heard
+                # as "E, iyo naiza lipa. Iyo naiza tafuta nilipe"). That's
+                # what was actually behind Francis re-asking the same
+                # question three times on that call -- the LLM was
+                # legitimately failing to parse genuinely garbled input, not
+                # a turn-scheduling bug. Reverted back to the
+                # ElevenLabs+OpenAI pairing below, which Whisper-validated
+                # correctly across this whole session. AMD's own English-
+                # only cartesia usage (below, separate from this) is
+                # unaffected -- this was never tested in English and the
+                # failure here is specifically a Swahili transcription
+                # quality issue.
                 # model="scribe_v2_realtime" already selects realtime mode;
                 # the plugin logs a warning if use_realtime=True is also
                 # passed alongside it (it's simply ignored), so it's left
